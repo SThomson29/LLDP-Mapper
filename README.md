@@ -1,267 +1,286 @@
 # lldp-mapper
 
-LLDP-based topology mapper for Aruba AOS-CX estates. Scans a subnet for
-switches, pulls LLDP, interface, VSX, and routing data over the AOS-CX
-REST API, and emits a multi-layer draw.io diagram plus a JSON inventory
-that can be diffed between runs.
+Topology mapper for Aruba AOS-CX estates. Point it at one or more
+management subnets with credentials and it discovers the switches,
+pulls LLDP, interface, VSX, and routing data over the REST API, and
+produces three things:
 
-No SSH scraping, no per-device config — point it at a management subnet
-with credentials and it maps what it finds.
+- a multi-page **draw.io diagram** (physical, L2, L3, routing views)
+- a **JSON inventory** that can be diffed between runs to catch
+  topology drift
+- an **`ip-addressing.csv`** — a flat, filterable addressing inventory
+  covering every SVI, routed port, and loopback
+
+No SSH scraping and nothing to configure on the switches beyond the
+REST API being enabled.
 
 ## Requirements
 
-- Python 3.9+ (tested on 3.12)
-- `requests` (`pip install requests`)
-- AOS-CX 10.04 or later (10.16 fully supported) with the REST API enabled (`https-server rest access-mode read-write` is not required — read-only is sufficient)
-- One or more accounts with at least operator rights (local or TACACS/RADIUS)
+- Python 3.9+ (tested on 3.12) and `requests` (`pip install requests`
+  or `pip install -r requirements.txt`)
+- AOS-CX 10.04 or later — 10.16 fully supported, and the API version
+  is negotiated per switch, so mixed-firmware estates are fine
+- One or more accounts with at least operator (read) rights, local or
+  TACACS/RADIUS
 
 ## Quick start
 
 ```bash
 export AOSCX_PASSWORD='...'          # or omit to be prompted
-python3 lldp_mapper.py scan 10.20.30.0/24 -u admin
+python3 lldp_mapper.py scan 10.20.30.0/24
 ```
 
-Multiple subnets can be scanned in one run — list them all and the
-results merge into a single topology, with any switch that answers on
-more than one scanned range (mgmt plus a routed interface, say)
-deduplicated by chassis MAC:
+That single command writes `topology.drawio`, `topology.json`, and
+`ip-addressing.csv`. Add `-u <user>` if the account isn't in your
+creds file (see below); `-o` renames the diagram (the JSON follows
+its name); `--json`, `--ipam`, `--no-json`, `--no-ipam` relocate or
+skip the data files.
+
+Several subnets can be scanned in one run and merge into a single
+topology. A switch that answers on more than one scanned range (its
+mgmt address plus a routed interface, say) is deduplicated by chassis
+MAC, so it appears once:
 
 ```bash
-python3 lldp_mapper.py scan 10.20.30.0/24 10.40.0.0/22 172.16.8.0/24 -u admin
+python3 lldp_mapper.py scan 10.20.30.0/24 10.40.0.0/22 172.16.8.0/24
 ```
 
-This writes `topology.drawio`, a matching `topology.json` inventory
-(used by diff mode), and an `ip-addressing.csv` addressing inventory —
-all by default. Use `-o` to rename (the JSON
-follows the diagram name), `--json` to place the inventory elsewhere,
-or `--no-json` to skip it.
+Open the `.drawio` file in [draw.io](https://app.diagrams.net) or the
+desktop app. Each view is a **page** — tabs along the bottom — and all
+pages share node positions, so flipping tabs feels like toggling
+views. (`--layered` produces the older single-page mode with
+toggleable layers instead, useful when you want views overlaid; edges
+are bowed per layer there to reduce overprinting.)
 
-Open `topology.drawio` in [draw.io](https://app.diagrams.net) or the
-desktop app. Each view is a **page** — tabs along the bottom of the
-canvas — with identical node positions, so flipping tabs reads like
-toggling views without any overlap. Pass `--layered` for the older
-single-page mode with toggleable layers (View → Layers) if you want
-views overlaid for comparison.
-The bare form `python3 lldp_mapper.py 10.20.30.0/24 -u admin` also works
-(`scan` is implied).
+## Credentials
 
-## What you get
-
-The diagram contains up to four views (pages by default, or layers
-with `--layered`), all sharing the same node positions so devices stay
-put as you switch. In layered mode, edges are additionally bowed per
-layer — physical straight, L2 one side, L3 the other, routing further
-out — to reduce overprinting when several layers are visible at once.
-
-**1 — Physical (LLDP)** — visible on open. One edge per discovered
-cable, with each port number rendered at its own end of the link —
-beside the switch it belongs to — so there is no ambiguity about
-which port is which. VSX pairs are placed side
-by side inside a dashed container with their role (primary/secondary)
-in the node label. Add `--include-endpoints` to also show APs, phones,
-and servers seen in LLDP as dashed grey leaf nodes — on both the
-physical page and the Layer 2 page, where endpoint links are labelled
-with the switch-side port's VLAN config (access VLAN or trunk list).
-This is also what makes single-switch or single-stack environments
-produce a useful Layer 2 page, since they have no inter-switch links.
-
-**2 — Layer 2 (LAGs / VLANs)** — physical links collapsed into their
-LAGs using each switch's LAG member lists, so a dual-cable VSX ISL
-renders as one edge labelled `lag256 ↔ lag256 · 2x links · trunk
-10-12,20 · native 1`. VLAN config is read from the aggregated interface
-and trunk lists are range-compressed.
-
-**3 — Layer 3 (subnets / VRFs)** — SVI and routed-port IPs grouped by
-(VRF, subnet). Point-to-point subnets (/31, /30) become direct edges
-labelled with both interface IPs; subnets spanning three or more
-switches render as a green subnet hub with a spoke per switch.
-Loopbacks (/32) are excluded. Non-default VRFs are named in the label.
-By default the page shows only *shared* subnets (adjacency); add
-`--all-subnets` to also render subnets attached to a single switch —
-every SVI and routed port as a leaf node — which is what gives a
-single-switch or single-stack estate a complete L3 page.
-
-**4 — Routing (OSPF / BGP)** — live protocol adjacencies. OSPF
-neighbours (orange, `area 0.0.0.0 · FULL`) are matched to inventory by
-neighbour interface IP with router-id fallback; BGP peers (purple,
-iBGP/eBGP distinguished with AS numbers and session state) by peer IP.
-Peers that aren't in the scanned inventory — WAN routers, firewalls —
-appear as amber "external peer" nodes rather than being dropped.
-
-## Multiple credentials
-
-Mixed-credential subnets are supported — credentials are tried in
-order per switch until one authenticates:
+Credentials are tried in order, per switch, until one authenticates —
+so mixed-credential estates need one run, not several:
 
 ```bash
-# interactive: prompted for each account's password, nothing on disk
+# interactive: prompted per account, nothing written to disk
 python3 lldp_mapper.py scan 10.20.30.0/24 -u admin -u svc_net
 
-# scheduled jobs: JSON file (chmod 600), tried before any -u accounts
+# scheduled jobs: JSON file, tried before any -u accounts
 python3 lldp_mapper.py scan 10.20.30.0/24 --creds /etc/lldp-mapper/creds.json
 ```
 
-See `creds.example.json` for the format — a JSON list of
-`{"username", "password"}` objects, tried top to bottom. Copy it,
-fill in real values, and `chmod 600` the result.
+`creds.example.json` shows the format — a JSON list of
+`{"username", "password"}` objects, tried top to bottom. Copy it, fill
+in real values, `chmod 600` it, and keep it out of git (the shipped
+`.gitignore` already does).
 
-Only an authentication rejection (HTTP 401) moves on to the next
-credential; unreachable hosts abort immediately so they don't burn
-attempts. Order the list most-likely-first: each wrong credential is a
-failed login on that switch, which counts against any account-lockout
-policy your AAA enforces. The scan log shows which username succeeded
-per switch.
+Two behaviours worth knowing. Only an authentication rejection
+(HTTP 401) advances to the next credential — unreachable hosts abort
+immediately, so dead boxes don't accumulate failed logins. And every
+wrong credential *is* a failed login on that switch, which counts
+against any lockout policy your AAA enforces — order the list
+most-likely-first and keep it short. The scan log names the username
+that succeeded on each switch. The same username may appear multiple
+times with different passwords (useful mid-rotation), and the log then
+doubles as a report of which switches still hold the old password.
 
-## IPAM CSV
+## The views
 
-Whenever interface details are collected, every scan also writes a flat
-addressing inventory as CSV (default: `ip-addressing.csv` alongside the
-diagram; override with `--ipam FILE`, skip with `--no-ipam`). One row per configured address across every SVI, routed
-port, and loopback:
+**Physical.** One edge per LLDP-discovered cable, with each port
+number rendered at its own end of the link, beside the switch it
+belongs to. VSX pairs sit side by side inside a dashed container with
+their role (primary/secondary) in the label. `--include-endpoints`
+adds APs, phones, and servers seen in LLDP as dashed grey leaf nodes.
+
+**Layer 2.** Physical links collapsed into their LAGs, so a dual-cable
+VSX ISL is one edge labelled `2x links · trunk 10-12,20 · native 1`
+with the LAG names at each end. VLAN config comes from the aggregated
+interface and trunk lists are range-compressed. With
+`--include-endpoints`, edge ports also appear labelled with their
+access VLAN or trunk config — which is what gives a single stack
+(no inter-switch links at all) a useful L2 view, and doubles as an
+edge-port VLAN audit anywhere else.
+
+**Layer 3.** SVI and routed-port addresses grouped by (VRF, subnet).
+Point-to-point subnets are direct edges with interface + IP at each
+end; a subnet shared by three or more switches becomes a hub with one
+spoke per switch. Loopbacks (/32) are excluded and non-default VRFs
+are named. Where a routing adjacency runs over a collected
+point-to-point subnet, the two merge into a single edge —
+`10.255.1.0/31` plus `OSPF FULL` on one link — which is what keeps
+p2p-heavy OSPF designs readable. By default only *shared* subnets
+appear (the page shows adjacency); `--all-subnets` also renders
+single-attached subnets as leaf nodes, giving a lone switch or stack
+a complete L3 picture.
+
+**Routing.** Live OSPF and BGP adjacencies: OSPF orange with area and
+state, BGP purple with iBGP/eBGP distinguished by AS numbers and
+session state. Peers matched to the inventory by interface/peer IP
+(router-id fallback for OSPF); anything unmatched — WAN routers,
+firewalls — renders as an amber "external peer" node rather than
+disappearing. An OSPF area or iBGP mesh spanning three or more
+switches collapses into a protocol hub with one spoke per member
+(an 8-switch iBGP full mesh is 8 spokes, not 28 edges).
+
+## Layout
+
+The tiered layout (default) infers the hierarchy from the wiring:
+cores are found by iterative minimum-degree peeling — access strips
+away first, then aggregation, and whoever survives is the core, which
+holds up on dual-homed designs where distance-based detection fails.
+VSX partners always land in the same tier. Below the core, switches
+cluster into distribution blocks under their own parent pair, with
+gaps between blocks and parents aligned directly above their children.
+Within a row, order follows the **primary parent's interface numbers**
+(the `-01`/`-a` device of a pair): core port 1/1/1's block sits
+leftmost, so the drawing matches the patching. The scan log names the
+detected core tier; pin it manually with `--core <hostname-or-IP>`
+(repeatable) if an unusual topology fools the detection, or use
+`--layout circle` for the original radial layout.
+
+## Large estates
+
+Two mechanisms keep big estates readable, both automatic:
+
+**Interface labels → tooltips.** Above 15 switches, per-end port
+labels move to hover tooltips (hover any link to see its ports) so
+the overview zoom stays clean. `--detail-labels` forces printed
+labels back.
+
+**Area-split pages.** At 16+ switches with two or more distribution
+blocks, the output splits into per-area tabs, grouped so you review
+one area completely before the next:
+
+- **Overview** — cores drawn in full, one summary node per block
+  (`agg-1 — 2 agg / 4 access`), uplinks aggregated to counted edges
+- **Core L3** — the core pair's own routed relations
+- **Core-Agg L1 / L2 / L3** — the full core-to-distribution cabling
+  with port detail, interconnect trunks, and interconnect
+  subnets/adjacencies
+- **per block: `agg-1 L1 / L2 / L3`** and so on — each block's own
+  pages, small enough that printed interface labels return
+
+Block names derive from hostname common prefixes (`agg-1a`/`agg-1b`
+→ `agg-1`). Control with `--split always|never|auto`. Addressing is
+deliberately *not* in the drawing at any size — that's the CSV's job.
+
+## The IP addressing CSV
+
+Every scan that collects interface details writes
+`ip-addressing.csv` (next to the diagram; `--ipam FILE` relocates it,
+`--no-ipam` skips it). One row per configured address:
 
 ```
 hostname, interface, vlan, ip, prefix, network, vrf, active_gateway
 ```
 
 Bare port numbers are written as `Interface 1/1/1` so spreadsheets
-don't parse them as dates. The `active_gateway` column carries the VSX
-active-gateway VIP where configured, `N/A` otherwise.
-
-It opens directly in Excel and filters/sorts like the IPAM it
-effectively is — the `network` column answers "what's on this subnet"
-in one filter. Being plain text, it also greps from a terminal and
-diffs cleanly in git alongside the JSON inventories, giving you
-address-change history for free. Addressing lives here rather than as
-tables in the drawing: diagrams do topology, the CSV does addresses.
+don't parse them as dates. `active_gateway` carries the VSX
+active-gateway VIP where configured, `N/A` otherwise. The `network`
+column is the workhorse: filter on it and you have every device on a
+subnet. It opens straight into Excel, greps from a jump host, and
+diffs in git next to the JSON inventories — dated filenames give you
+address-change history for free.
 
 ## Diff mode
 
-Every scan writes a JSON inventory alongside the diagram by default —
-keep them (dated filenames help) and compare any two:
+Every scan writes a JSON inventory by default; keep them and compare
+any two:
 
 ```bash
 python3 lldp_mapper.py diff last-week.json today.json -o diff.drawio
 ```
 
-Console output lists added/removed devices and links; the optional
+The console lists added/removed devices and links; the optional
 diagram shows additions in green, removals in red dashed, unchanged in
-grey. Exit codes are automation-friendly: **0** = no change, **2** =
-changes detected, **1** = error, so it drops straight into a scheduled
-job that alerts on topology drift, or into pre/post-change validation
-during migrations.
+grey. Exit codes are automation-friendly — **0** no change, **2**
+changes detected, **1** error — so it drops into a scheduled job that
+alerts on topology drift, or into pre/post-change validation during
+migrations.
 
 ## Options
 
 | Flag | Default | Notes |
 |---|---|---|
-| `-o, --output` | `topology.drawio` | draw.io output path |
-| `--json FILE` | derived from `-o` | JSON inventory path (needed for diff) |
-| `--no-json` | off | skip the JSON inventory |
-| `--all-subnets` | off | render single-attached subnets (SVIs, uplink /30s) as leaf nodes on the L3 page |
-| `--layered` | off | single page with toggleable layers instead of one page per view |
-| `--include-endpoints` | off | show non-switch LLDP neighbours |
-| `--physical-only` | off | skip L2/L3/routing collection entirely |
+| `-u, --username` | — | repeatable; each prompted for a password (single `-u` + `AOSCX_PASSWORD` stays non-interactive) |
+| `--creds FILE` | — | JSON credential list, tried before `-u` accounts |
+| `-o, --output` | `topology.drawio` | diagram path; the JSON inventory follows its name |
+| `--json FILE` / `--no-json` | derived / off | JSON inventory path / skip it (needed for diff) |
+| `--ipam FILE` / `--no-ipam` | `ip-addressing.csv` / off | addressing CSV path / skip it |
+| `--api-version` | `auto` | negotiate latest via `GET /rest`; pin e.g. `v10.04` to override |
+| `--split` | `auto` | area-split pages: auto engages at 16+ switches with 2+ blocks |
+| `--detail-labels` | off | force printed port labels above the 15-switch tooltip threshold |
+| `--layout` | `tiered` | or `circle` for the original radial layout |
+| `--core HOST` | — | pin core switch(es) by hostname or IP; repeatable |
+| `--layered` | off | single page with toggleable layers instead of pages |
+| `--all-subnets` | off | render single-attached subnets as L3 leaf nodes |
+| `--include-endpoints` | off | show APs/phones/servers, with VLANs on the L2 view |
+| `--physical-only` | off | skip all L2/L3/routing collection |
 | `--no-routing` | off | keep L2/L3 but skip the OSPF/BGP walks |
-| `--api-version` | `auto` | negotiates latest via `GET /rest` (v10.16 on 10.16 firmware); pin e.g. `v10.04` to override |
-| `--scan-workers` | 64 | concurrent TCP probes during subnet scan |
-| `--poll-workers` | 8 | concurrent switch polls — keep modest, see below |
+| `--scan-workers` | 64 | concurrent TCP probes during discovery |
+| `--poll-workers` | 8 | concurrent switch polls — keep modest (session limits) |
 | `--verify-ssl` | off | most switch mgmt certs are self-signed |
 | `-v, --verbose` | off | debug logging |
+
+`diff` takes `old.json new.json`, plus `-o` for the diagram and `-v`.
 
 ## Operational notes
 
 **REST session limits.** AOS-CX caps concurrent REST sessions per
 switch (typically six). The client logs out on every exit path,
-including errors, but avoid cranking `--poll-workers` high or running
-multiple instances against the same switches simultaneously — a
-lingering session lockout means waiting for the idle timeout.
+including errors, but don't crank `--poll-workers` high or run
+multiple instances against the same switches at once — a lingering
+lockout means waiting out the idle timeout.
 
-**API versioning.** Each switch's API version is negotiated up front
-via an unauthenticated `GET /rest`, using the switch-declared latest
-(v10.16 on 10.16 firmware) per Aruba's best-practice guidance — so
-mixed-firmware estates each get their newest schema, and platforms
-introduced in 10.15+ (which don't publish the old versions) work
-without configuration. If the version index is unreachable the client
-falls back to v10.04, which all 10.04+ firmware publishes. The
-negotiated version is shown per switch in the scan log.
+**API versioning.** Each switch's version is negotiated up front via
+an unauthenticated `GET /rest`, using the switch-declared latest, per
+Aruba's guidance — mixed-firmware estates each get their newest
+schema, and 10.15+-only platforms work without configuration. If the
+index is unreachable the client falls back to v10.04. The negotiated
+version appears per switch in the scan log.
 
-**Firmware compatibility.** LLDP and interface data are fetched with a
-single wildcard query (`/system/interfaces/*/...`) where the firmware
-supports it, silently falling back to per-interface iteration on older
-releases. The OSPF/BGP walk is per-resource and prunes any branch that
-404s, so mixed-routing estates are fine.
+**Collection resilience.** Interface and LLDP data use a single
+wildcard query where the firmware supports it, falling back to
+per-interface iteration otherwise. An SVI that returns no address in
+the filtered response (seen on some firmware when the VLAN is down)
+gets one unfiltered re-fetch, and recoveries are logged. Active
+gateway is collected by a separate, fully isolated query — if a
+firmware rejects that attribute, the only effect is `N/A` in the CSV
+column. If a switch somehow yields no interface details at all, a
+warning names it rather than letting the gap pass silently. The
+OSPF/BGP walk is per-resource and prunes any branch that 404s.
 
-**Scan scope.** Discovery is a TCP probe of port 443 across each CIDR;
-anything answering gets one REST login attempt. Non-CX devices with
+**Scan scope.** Discovery is a TCP probe of 443 across each CIDR;
+anything answering gets a REST login attempt. Non-CX devices with
 HTTPS management (iLO, printers, firewalls) are skipped with a warning
-after the login fails — harmless, but expect log noise on busy subnets,
-and be mindful of what a failed login means on devices with lockout
-policies.
-
-**Layout.** The default tiered layout infers the hierarchy from the
-topology itself: the core is found by iterative
-minimum-degree peeling (access switches strip away first, then
-aggregation, leaving the core — robust on dual-homed designs, with VSX
-partners always kept together) and forms the top row, and every further tier is one hop down, so a 3-tier campus renders
-as core / aggregation / access rows with endpoints hanging below their
-switch. Rows are barycentre-ordered to keep access switches under
-their own aggregation and minimise crossing links. If auto-detection
-picks the wrong core on an unusual topology, pin it with `--core
-<hostname-or-IP>` (repeatable); `--layout circle` restores the original
-radial layout. Below each tier, switches are
-clustered into distribution blocks under their own parent pair, with
-gaps between blocks and parents aligned directly above their children.
-Port labels and pages survive manual re-arrangement in draw.io.
-
-**Area-split pages (large estates).** On estates of 16+ switches with
-two or more distribution blocks, the output splits into per-area tabs
-grouped so you review one area completely before the next: **Overview**
-(cores plus one summary node per block, aggregated uplink counts),
-**Core L3** (core-pair routed relations), then the **Core-Agg** set —
-L1 (the full core-to-distribution cabling with port detail), L2, L3
-(interconnect subnets and adjacencies), IPAM (core + agg addressing) —
-then per block: **agg-1 L1 / L2 / L3 / IPAM** and so on. On L3 pages, a point-to-point subnet and the
-adjacency running over it merge into a single edge — `10.255.1.0/31`
-plus `OSPF FULL` on one link, rather than parallel subnet and protocol
-edges — which is what keeps p2p-heavy designs readable; adjacencies
-with no matching collected subnet still draw separately. Within
-every row, switches are ordered by their uplink's parent-side interface
-number, so the diagram matches the physical patching. Control with
-`--split always|never|auto`.
-
-**Large estates (flat mode).** Above 15 switches, per-end interface labels move to
-hover tooltips automatically (hover any link to see its ports); force
-printed labels with `--detail-labels`. On the Routing page, OSPF areas
-and iBGP meshes spanning three or more switches collapse into a
-protocol hub with one spoke per member — an 8-switch iBGP full mesh
-renders as 8 spokes instead of 28 pairwise edges. eBGP and external
-peerings stay as direct edges.
+after the login fails — harmless, but expect log noise on busy
+subnets, and remember that failed logins matter on devices with
+lockout policies. A single host can be included as a `/32`.
 
 ## Tests
 
-Offline suites run against synthetic fixtures — no switches needed:
+Offline suites against synthetic fixtures — no switches needed:
 
 ```bash
-python3 test_mapper.py            # parsing, dedup, physical XML
-python3 test_layers.py            # L2 aggregation, L3 segments, layers
+python3 test_mapper.py            # parsing, dedup, physical output
+python3 test_layers.py            # L2 aggregation, L3 segments, layered mode
 python3 test_routing_vsx_diff.py  # VSX pairing, OSPF/BGP, diff mode
-python3 test_pages.py             # multi-page output
+python3 test_pages.py             # multi-page output, IPAM CSV
+python3 test_credentials.py       # credential iteration, multi-subnet dedupe
+python3 test_tiered.py            # tiered layout, core detection, --core
+python3 test_large_estate.py      # blocks, area split, tooltips, regressions
 ```
 
-The shared fixture (`test_mapper_common.py`) models a VSX core pair
-with a dual-cable ISL, LAG uplinks, a CORP-VRF SVI across three
-switches, a /31 OSPF link, iBGP between cores, and an external eBGP
-peer.
+The regression suite includes the field failures this tool has
+actually hit: dual-homed core detection, crossed-patching port order,
+and the firmware combination that once emptied interface collection.
 
 ## Files
 
 ```
 lldp_mapper.py             the tool (stdlib + requests only)
-test_mapper.py             base test suite
-test_layers.py             L2/L3 layer tests
-test_routing_vsx_diff.py   routing / VSX / diff tests
-test_mapper_common.py      shared synthetic fixtures
-sample_full.drawio         example 4-layer output
+requirements.txt           just requests (create if you want pip -r)
+creds.example.json         credential file template
+.gitignore                 keeps output, addressing CSVs, and real creds out
+test_*.py                  the seven suites above (+ shared fixtures
+                           in test_mapper_common.py)
+sample_full.drawio         example multi-page output
+sample_layered.drawio      example single-page layered output
 sample_diff.drawio         example diff output
 ```
