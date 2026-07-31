@@ -210,7 +210,7 @@ migrations.
 | `--core HOST` | — | pin core switch(es) by hostname or IP; repeatable |
 | `--layered` | off | single page with toggleable layers instead of pages |
 | `--all-subnets` | off | render single-attached subnets as L3 leaf nodes |
-| `--include-endpoints` | off | show APs/phones/servers, with VLANs on the L2 view |
+| `--include-endpoints` | off | show devices that respond to LLDP with MAC/Hostname included if available |
 | `--physical-only` | off | skip all L2/L3/routing collection |
 | `--no-routing` | off | keep L2/L3 but skip the OSPF/BGP walks |
 | `--scan-workers` | 64 | concurrent TCP probes during discovery |
