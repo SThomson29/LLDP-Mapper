@@ -280,3 +280,58 @@ assert len(pair_edges) == 1, len(pair_edges)
 lbl = pair_edges[0].get("value") or ""
 assert "10.255.1.0/31" in lbl and "OSPF FULL" in lbl, lbl
 print("p2p merge OK (one edge per /31: subnet + OSPF FULL combined)")
+
+# --- REGRESSION: the firmware combination that broke the field run -----------
+# wildcard rejected with 404 AND unknown attributes rejected with 400:
+# core collection must survive untouched, AG degrades to N/A.
+import requests as _rq
+from lldp_mapper import AosCxRest as _ACR
+
+class _Resp:
+    def __init__(self, code): self.status_code = code
+def _err(code):
+    e = _rq.HTTPError(str(code)); e.response = _Resp(code); return e
+
+class BreakFw(_ACR):
+    def __init__(self): self.host = "sim-broken"
+    def get(self, path, params=None):
+        attrs = (params or {}).get("attributes", "")
+        if "vsx_virtual_ip4" in attrs:
+            raise _err(400)                    # unknown attribute
+        if path == "/system/interfaces/*":
+            raise _err(404)                    # wildcard unsupported
+        if path == "/system/interfaces":
+            return {"1/1/1": "u", "vlan10": "u"}
+        if path.startswith("/system/interfaces/"):
+            name = path.rsplit("/", 1)[-1]
+            if name == "vlan10":
+                return {"ip4_address": "10.10.0.1/24", "vlan_mode": None,
+                        "vlan_tag": None, "vlan_trunks": None, "vrf": None}
+            return {"ip4_address": None, "vlan_mode": "access",
+                    "vlan_tag": {"20": "u"}, "vlan_trunks": None,
+                    "vrf": None}
+        raise AssertionError(path)
+
+bdet = BreakFw().interface_details()
+assert len(bdet) == 2, bdet
+assert bdet["vlan10"].ip4 == ["10.10.0.1/24"]
+assert bdet["vlan10"].active_gateway == ""       # -> N/A in CSV
+assert bdet["1/1/1"].access_vlan == 20
+print("broken-firmware regression OK (full details survive, AG degrades)")
+
+# AG still collected where the attribute IS supported
+class AgFw(_ACR):
+    def __init__(self): self.host = "sim-ag"
+    def get(self, path, params=None):
+        attrs = (params or {}).get("attributes", "")
+        if path == "/system/interfaces/*" and "vsx_virtual_ip4" in attrs:
+            return {"vlan10": {"vsx_virtual_ip4": ["10.10.0.254/24"]}}
+        if path == "/system/interfaces/*":
+            return {"vlan10": {"ip4_address": "10.10.0.1/24",
+                               "vlan_mode": None, "vlan_tag": None,
+                               "vlan_trunks": None, "vrf": None}}
+        raise AssertionError(path)
+
+adet = AgFw().interface_details()
+assert adet["vlan10"].active_gateway == "10.10.0.254"
+print("active-gateway collection OK where supported")

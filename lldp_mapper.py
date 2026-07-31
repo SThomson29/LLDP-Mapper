@@ -366,15 +366,8 @@ class AosCxRest:
                 result[ifname] = neighbors
         return result
 
-    IF_ATTRS_BASE = ("vlan_mode,vlan_tag,vlan_trunks,ip4_address,"
-                     "ip4_address_secondary,interfaces,vrf")
-    # vsx_virtual_ip4 = active-gateway VIP list; requested opportunistically
-    # and dropped for the session if any firmware rejects the attribute.
-    IF_ATTRS = IF_ATTRS_BASE + ",vsx_virtual_ip4"
-
-    def _if_attrs(self) -> str:
-        return (self.IF_ATTRS_BASE if getattr(self, "_no_vsx_vip", False)
-                else self.IF_ATTRS)
+    IF_ATTRS = ("vlan_mode,vlan_tag,vlan_trunks,ip4_address,"
+                "ip4_address_secondary,interfaces,vrf")
 
     def vsx_info(self) -> VsxInfo | None:
         """Return VSX config, or None if the switch isn't a VSX member.
@@ -508,26 +501,60 @@ class AosCxRest:
         if refetched:
             log.info("%s: recovered addresses for %d down SVI(s) via "
                      "unfiltered re-fetch", self.host, refetched)
+        if not result:
+            log.warning("%s: no interface details collected — L2/L3 "
+                        "views and addressing for this switch will be "
+                        "empty (run with -v for the failing responses)",
+                        self.host)
+            return result
+        # Active-gateway VIPs: fully isolated best-effort query. The
+        # attribute name is unverified across firmware families, so any
+        # failure here must never disturb the core collection above.
+        try:
+            self._collect_active_gateways(result)
+        except Exception as exc:                     # noqa: BLE001
+            log.debug("%s: active-gateway collection unavailable (%s)",
+                      self.host, type(exc).__name__)
         return result
+
+    def _collect_active_gateways(self, result: dict) -> None:
+        svis = [n for n, p in result.items() if p.is_svi]
+        if not svis:
+            return
+        found = 0
+        try:
+            data = self.get("/system/interfaces/*",
+                            params={"attributes": "vsx_virtual_ip4",
+                                    "depth": 2})
+            for k, v in (data or {}).items():
+                name = urllib.parse.unquote(k)
+                if name in result and isinstance(v, dict):
+                    vip = self._parse_vip(v.get("vsx_virtual_ip4"))
+                    if vip:
+                        result[name].active_gateway = vip
+                        found += 1
+        except requests.HTTPError:
+            for name in svis:
+                enc = urllib.parse.quote(name, safe="")
+                try:
+                    v = self.get(f"/system/interfaces/{enc}",
+                                 params={"attributes": "vsx_virtual_ip4",
+                                         "depth": 1})
+                except requests.HTTPError:
+                    return          # attribute unsupported: all N/A
+                vip = self._parse_vip((v or {}).get("vsx_virtual_ip4"))
+                if vip:
+                    result[name].active_gateway = vip
+                    found += 1
+        if found:
+            log.debug("%s: %d active-gateway VIP(s) collected",
+                      self.host, found)
 
     def _interface_details_raw(self) -> dict[str, PortInfo]:
         try:
-            try:
-                data = self.get("/system/interfaces/*",
-                                params={"attributes": self._if_attrs(),
-                                        "depth": 2})
-            except requests.HTTPError as exc:
-                if (exc.response is not None
-                        and exc.response.status_code == 400
-                        and not getattr(self, "_no_vsx_vip", False)):
-                    log.debug("%s: vsx_virtual_ip4 unsupported, retrying "
-                              "without it", self.host)
-                    self._no_vsx_vip = True
-                    data = self.get("/system/interfaces/*",
-                                    params={"attributes": self._if_attrs(),
-                                            "depth": 2})
-                else:
-                    raise
+            data = self.get("/system/interfaces/*",
+                            params={"attributes": self.IF_ATTRS,
+                                    "depth": 2})
             return {urllib.parse.unquote(k): self._parse_port(
                         urllib.parse.unquote(k), v)
                     for k, v in (data or {}).items() if isinstance(v, dict)}
@@ -539,7 +566,7 @@ class AosCxRest:
             enc = urllib.parse.quote(ifname, safe="")
             try:
                 data = self.get(f"/system/interfaces/{enc}",
-                                params={"attributes": self._if_attrs(),
+                                params={"attributes": self.IF_ATTRS,
                                         "depth": 1})
             except requests.HTTPError:
                 continue
@@ -569,14 +596,17 @@ class AosCxRest:
             if isinstance(data.get("vrf"), dict) else data.get("vrf")
         ) or "default"
         p.lag_members = _keys_or_uris(data.get("interfaces"))
-        vip = data.get("vsx_virtual_ip4")
-        if isinstance(vip, list) and vip:
-            p.active_gateway = str(vip[0]).split("/")[0]
-        elif isinstance(vip, dict) and vip:
-            p.active_gateway = str(next(iter(vip))).split("/")[0]
-        elif isinstance(vip, str) and vip:
-            p.active_gateway = vip.split("/")[0]
         return p
+
+    @staticmethod
+    def _parse_vip(vip) -> str:
+        if isinstance(vip, list) and vip:
+            return str(vip[0]).split("/")[0]
+        if isinstance(vip, dict) and vip:
+            return str(next(iter(vip))).split("/")[0]
+        if isinstance(vip, str) and vip:
+            return vip.split("/")[0]
+        return ""
 
     @staticmethod
     def _parse_neighbor_map(data: dict) -> list[dict]:
