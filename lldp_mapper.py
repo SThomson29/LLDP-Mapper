@@ -1471,7 +1471,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="scan a subnet and map the topology")
-    scan.add_argument("subnet", help="CIDR to scan, e.g. 10.20.30.0/24")
+    scan.add_argument("subnet", nargs="+",
+                      help="one or more CIDRs to scan, e.g. "
+                           "10.20.30.0/24 10.40.0.0/22")
     scan.add_argument("-u", "--username", action="append", default=[],
                       help="username to try; repeat for multiple accounts "
                            "(tried in order per switch, prompted for each "
@@ -1579,13 +1581,34 @@ def gather_credentials(args) -> list[tuple[str, str]]:
     return creds
 
 
+def dedupe_polled(polled: list[PollResult]) -> list[PollResult]:
+    """Drop duplicate polls of the same switch (seen via multiple IPs
+    when scanned ranges cover both its mgmt and routed interfaces),
+    keyed by chassis MAC. First result wins."""
+    seen: dict[str, str] = {}
+    out: list[PollResult] = []
+    for pr in polled:
+        key = pr.device.key
+        if key in seen:
+            log.info("%s: same switch already polled via %s — skipping "
+                     "duplicate", pr.device.mgmt_ip, seen[key])
+            continue
+        seen[key] = pr.device.mgmt_ip
+        out.append(pr)
+    return out
+
+
 def run_scan(args) -> int:
     credentials = gather_credentials(args)
     if not credentials:
         log.error("no credentials supplied — use -u and/or --creds")
         return 1
 
-    candidates = scan_subnet(args.subnet, workers=args.scan_workers)
+    candidates: list[str] = []
+    for cidr in args.subnet:
+        candidates.extend(scan_subnet(cidr, workers=args.scan_workers))
+    # Dedupe hosts across overlapping ranges, keep stable IP order.
+    candidates = sorted(set(candidates), key=ipaddress.ip_address)
     if not candidates:
         log.error("No hosts responding on tcp/443 — nothing to do.")
         return 1
@@ -1605,6 +1628,7 @@ def run_scan(args) -> int:
             if result:
                 polled.append(result)
 
+    polled = dedupe_polled(polled)
     if not polled:
         log.error("No AOS-CX switches successfully polled.")
         return 1

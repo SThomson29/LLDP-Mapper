@@ -95,3 +95,21 @@ ns3 = types.SimpleNamespace(creds="missing.json", username=[])
 assert gather_credentials(ns3) == []
 os.remove("creds_test.json")
 print("credential assembly OK (file order, env single-user, missing file)")
+
+# --- multi-subnet: duplicate device polls collapse by chassis MAC ------------
+from lldp_mapper import Device, PollResult, dedupe_polled
+
+def _pr(mac, ip, host):
+    return PollResult(device=Device(key=mac, hostname=host, mgmt_ip=ip,
+                                    is_switch=True))
+
+polled = [
+    _pr("aa:bb:cc:00:00:01", "10.1.0.1", "core-01"),
+    _pr("aa:bb:cc:00:00:02", "10.1.0.2", "core-02"),
+    # core-01 seen again via its routed interface on a second subnet
+    _pr("aa:bb:cc:00:00:01", "10.2.0.1", "core-01"),
+]
+deduped = dedupe_polled(polled)
+assert len(deduped) == 2
+assert [p.device.mgmt_ip for p in deduped] == ["10.1.0.1", "10.1.0.2"]
+print("multi-subnet dedupe OK (duplicate switch dropped, first IP kept)")

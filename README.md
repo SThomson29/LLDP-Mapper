@@ -22,6 +22,15 @@ export AOSCX_PASSWORD='...'          # or omit to be prompted
 python3 lldp_mapper.py scan 10.20.30.0/24 -u admin
 ```
 
+Multiple subnets can be scanned in one run — list them all and the
+results merge into a single topology, with any switch that answers on
+more than one scanned range (mgmt plus a routed interface, say)
+deduplicated by chassis MAC:
+
+```bash
+python3 lldp_mapper.py scan 10.20.30.0/24 10.40.0.0/22 172.16.8.0/24 -u admin
+```
+
 This writes `topology.drawio` and a matching `topology.json` inventory
 (used by diff mode) — both by default. Use `-o` to rename (the JSON
 follows the diagram name), `--json` to place the inventory elsewhere,
@@ -92,8 +101,9 @@ python3 lldp_mapper.py scan 10.20.30.0/24 -u admin -u svc_net
 python3 lldp_mapper.py scan 10.20.30.0/24 --creds /etc/lldp-mapper/creds.json
 ```
 
-`creds.json` is a list: `[{"username": "admin", "password": "..."},
-{"username": "svc_net", "password": "..."}]`.
+See `creds.example.json` for the format — a JSON list of
+`{"username", "password"}` objects, tried top to bottom. Copy it,
+fill in real values, and `chmod 600` the result.
 
 Only an authentication rejection (HTTP 401) moves on to the next
 credential; unreachable hosts abort immediately so they don't burn
@@ -159,7 +169,7 @@ supports it, silently falling back to per-interface iteration on older
 releases. The OSPF/BGP walk is per-resource and prunes any branch that
 404s, so mixed-routing estates are fine.
 
-**Scan scope.** Discovery is a TCP probe of port 443 across the CIDR;
+**Scan scope.** Discovery is a TCP probe of port 443 across each CIDR;
 anything answering gets one REST login attempt. Non-CX devices with
 HTTPS management (iLO, printers, firewalls) are skipped with a warning
 after the login fails — harmless, but expect log noise on busy subnets,
