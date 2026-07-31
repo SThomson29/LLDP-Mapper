@@ -129,10 +129,13 @@ sxml = to_drawio_xml(topo, l3_segments=segs, routing_adjs=adjs,
 sroot = ET.fromstring(sxml)
 names = [d.get("name") for d in sroot.findall("diagram")]
 assert names[0] == "Overview"
-for want in ("agg-1 - Physical", "agg-2 - Physical", "agg-3 - Physical",
-             "Core - Routed", "Core/Agg - Routed", "agg-1 - Routed"):
+for want in ("Core-Agg L1", "agg-1 L1", "agg-2 L1", "agg-3 L1",
+             "Core L3", "Core-Agg L3", "agg-1 L3"):
     assert want in names, (want, names)
 assert "Physical" not in names          # flat pages replaced
+# area grouping: agg-1's pages are adjacent
+i1 = names.index("agg-1 L1")
+assert names[i1 + 1] == "agg-1 L3"      # no L2 data in this fixture
 print(f"area split OK ({len(names)} tabs: {', '.join(names[:4])}, ...)")
 
 # Overview: 2 cores + 3 block nodes, aggregated '2 links' uplink edges
@@ -150,13 +153,77 @@ print("overview OK (cores + 3 block nodes, aggregated uplinks)")
 # enough for printed detail; the core<->agg /31 lands on Core/Agg page
 def page_named(n):
     return next(d for d in sroot.findall("diagram") if d.get("name") == n)
-b1 = page_named("agg-1 - Routed")
+b1 = page_named("agg-1 L3")
 vals = " ".join(c.get("value") or "" for c in b1.findall(".//mxCell"))
 assert "10.255.1.0/31" in vals and "10.254.0.0/31" not in vals
-ca = page_named("Core/Agg - Routed")
+ca = page_named("Core-Agg L3")
 cav = " ".join(c.get("value") or "" for c in ca.findall(".//mxCell"))
 assert "10.254.0.0/31" in cav
-core_rt = page_named("Core - Routed")
+core_rt = page_named("Core L3")
 crv = " ".join(c.get("value") or "" for c in core_rt.findall(".//mxCell"))
 assert "iBGP AS 65001" in crv
 print("routed scoping OK (p2p /31s land on the right area pages)")
+
+# --- L1 core-agg page carries the full core<->dist cabling -------------------
+ca_l1 = page_named("Core-Agg L1")
+ca_nodes = [c.get("value") or "" for c in ca_l1.findall(".//mxCell")
+            if c.get("vertex") == "1" and c.get("connectable") != "0"]
+hosts = {v.split("\n")[0] for v in ca_nodes if v and v != "VSX"}
+assert hosts == {"core-01", "core-02", "agg-1a", "agg-1b", "agg-2a",
+                 "agg-2b", "agg-3a", "agg-3b"}, hosts
+# core<->agg links present: 12 uplinks + 1 ISL + 3 pair links
+ca_edges = [c for c in ca_l1.findall(".//mxCell") if c.get("edge")] + \
+           [c for c in ca_l1.findall(".//object")]
+assert len(ca_edges) == 16, len(ca_edges)
+print("Core-Agg L1 OK (cores + all agg pairs, full uplink cabling)")
+
+# --- port-number ordering: children follow parent interface numbers ----------
+from lldp_mapper import Device as _D, Edge as _E, Topology as _T
+pt = _T()
+km = {}
+for i, n in enumerate(["core-01", "sw-zulu", "sw-alpha", "sw-mike"]):
+    km[n] = f"dd:00:00:00:00:0{i}"
+    pt.upsert_device(_D(key=km[n], hostname=n, is_switch=True))
+# patching order deliberately disagrees with alphabetical order
+pt.add_edge(_E(a_key=km["core-01"], a_port="1/1/1",
+               b_key=km["sw-zulu"], b_port="1/1/51"))
+pt.add_edge(_E(a_key=km["core-01"], a_port="1/1/2",
+               b_key=km["sw-alpha"], b_port="1/1/51"))
+pt.add_edge(_E(a_key=km["core-01"], a_port="1/1/10",
+               b_key=km["sw-mike"], b_port="1/1/51"))
+ppos = _layout(pt, [])
+xs = [ppos[km[n]][0] for n in ("sw-zulu", "sw-alpha", "sw-mike")]
+assert xs[0] < xs[1] < xs[2], xs   # 1/1/1 < 1/1/2 < 1/1/10, not A-Z
+print("port ordering OK (1/1/1, 1/1/2, 1/1/10 left to right)")
+
+# --- down-SVI fallback: unfiltered re-fetch recovers the address -------------
+from lldp_mapper import AosCxRest
+
+class SviFake(AosCxRest):
+    calls = []
+    def __init__(self):
+        self.host = "10.0.0.9"
+    def get(self, path, params=None):
+        SviFake.calls.append((path, bool(params and "attributes"
+                                         in params)))
+        if path == "/system/interfaces/*":
+            return {"vlan50": {"vlan_mode": None, "vlan_tag": None,
+                               "vlan_trunks": None, "ip4_address": None,
+                               "vrf": None},
+                    "vlan10": {"vlan_mode": None, "vlan_tag": None,
+                               "vlan_trunks": None,
+                               "ip4_address": "10.10.0.1/24",
+                               "vrf": None}}
+        if path == "/system/interfaces/vlan50":
+            return {"ip4_address": "10.50.0.1/24", "vlan_mode": None,
+                    "vlan_tag": None, "vlan_trunks": None, "vrf": None}
+        raise AssertionError(path)
+
+det = SviFake().interface_details()
+assert det["vlan50"].ip4 == ["10.50.0.1/24"]      # recovered
+assert det["vlan10"].ip4 == ["10.10.0.1/24"]      # untouched
+# exactly one extra unfiltered fetch, only for the empty SVI
+extra = [p for p, filt in SviFake.calls
+         if p == "/system/interfaces/vlan50"]
+assert len(extra) == 1
+print("down-SVI fallback OK (address recovered via unfiltered re-fetch)")

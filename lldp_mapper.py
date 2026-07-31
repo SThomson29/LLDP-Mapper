@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import csv
 import getpass
 import ipaddress
 import json
@@ -473,7 +474,35 @@ class AosCxRest:
         """Return {ifname: PortInfo} for every interface.
 
         Wildcard first, per-interface fallback, matching lldp_neighbors().
+        SVIs that come back with no IPv4 address get one unfiltered
+        re-fetch: some firmware has been observed to omit ip4_address
+        from attribute-filtered responses on down SVIs (VLAN with no
+        active members), and the full resource body still carries the
+        configured address.
         """
+        result = self._interface_details_raw()
+        refetched = 0
+        for name, p in result.items():
+            if not (p.is_svi and not p.ip4):
+                continue
+            enc = urllib.parse.quote(name, safe="")
+            try:
+                full = self.get(f"/system/interfaces/{enc}",
+                                params={"depth": 1})
+            except requests.HTTPError:
+                continue
+            fixed = self._parse_port(name, full or {})
+            if fixed.ip4:
+                log.debug("%s: %s address only in unfiltered fetch "
+                          "(down SVI?): %s", self.host, name, fixed.ip4)
+                result[name] = fixed
+                refetched += 1
+        if refetched:
+            log.info("%s: recovered addresses for %d down SVI(s) via "
+                     "unfiltered re-fetch", self.host, refetched)
+        return result
+
+    def _interface_details_raw(self) -> dict[str, PortInfo]:
         try:
             data = self.get("/system/interfaces/*",
                             params={"attributes": self.IF_ATTRS, "depth": 2})
@@ -1117,6 +1146,12 @@ def classify_scopes(topo: Topology,
     return info
 
 
+def _port_sort_key(port: str) -> tuple:
+    """Natural sort for interface names: 1/1/2 before 1/1/10."""
+    nums = tuple(int(x) for x in re.findall(r"\d+", port or ""))
+    return nums if nums else (10**9,)
+
+
 TIER_H = 280.0        # vertical distance between tiers
 UNIT_W = NODE_W + 90  # horizontal slot per switch
 
@@ -1193,24 +1228,6 @@ def _layout_tiered(topo: Topology,
 
         # Barycentric ordering: place units under the mean slot of their
         # neighbours in the tier above; two top-down passes suffice here.
-        slot: dict[str, float] = {}
-        for t in sorted(unit_rows):
-            for i, unit in enumerate(unit_rows[t]):
-                for n in unit:
-                    slot[n] = float(i)
-        for _ in range(2):
-            for t in sorted(unit_rows):
-                if t == min(unit_rows):
-                    continue
-                def bary(unit):
-                    ups = [slot[m] for n in unit for m in adj[n]
-                           if depths.get(m, 99) == t - 1]
-                    return (sum(ups) / len(ups)) if ups else 1e9
-                unit_rows[t].sort(key=bary)
-                for i, unit in enumerate(unit_rows[t]):
-                    for n in unit:
-                        slot[n] = float(i)
-
         # Distribution-block grouping: below the core tier, cluster each
         # unit under its dominant parent unit (most uplinks), keep blocks
         # in the parents' order, then align parents over their children
@@ -1237,9 +1254,25 @@ def _layout_tiered(topo: Topology,
                 best = (min(votes, key=lambda k: (-votes[k], k))
                         if votes else 10**6)
                 groups.setdefault(best, []).append(unit)
+            # Within a group, order children by the lowest parent-side
+            # interface number of their uplink, so the diagram matches
+            # the physical patching (core 1/1/1 -> first agg, etc.).
+            def uplink_port_key(unit):
+                best = (10**9,)
+                unit_set = set(unit)
+                for e in topo.edges.values():
+                    for child, parent, pport in (
+                            (e.a_key, e.b_key, e.b_port),
+                            (e.b_key, e.a_key, e.a_port)):
+                        if (child in unit_set
+                                and depths.get(parent, 99) == t - 1):
+                            k = _port_sort_key(pport)
+                            if k < best:
+                                best = k
+                return (best, topo.devices[unit[0]].hostname or unit[0])
             ordered: list[list[str]] = []
             for gi in sorted(groups):
-                ordered.extend(groups[gi])
+                ordered.extend(sorted(groups[gi], key=uplink_port_key))
             unit_rows[t] = ordered
             group_of[t] = groups
             for i, unit in enumerate(ordered):
@@ -1769,16 +1802,6 @@ def _scope_of_pair(info: "ScopeInfo", a: str, b: str) -> tuple:
     return ("coreagg",)
 
 
-IPAM_NODE_STYLE = (
-    "html=1;whiteSpace=wrap;align=left;verticalAlign=top;"
-    "fillColor=#ffffff;strokeColor=#666666;fontFamily=Helvetica;"
-    "fontSize=10;overflow=fill;"
-)
-IPAM_COLS = 3
-IPAM_W = 340.0
-IPAM_ROW_H = 19.0
-
-
 def _ipam_rows(details: dict[str, "PortInfo"]) -> list[tuple]:
     rows = []
     for p in details.values():
@@ -1790,48 +1813,45 @@ def _ipam_rows(details: dict[str, "PortInfo"]) -> list[tuple]:
     return [r[1:] for r in rows]
 
 
-def _render_ipam(xb: "_XmlBuilder", parent: str, topo: Topology,
-                 port_details: dict[str, dict[str, "PortInfo"]]) -> None:
-    """One HTML table per switch: Interface / VLAN / IP / VRF."""
-    col_heights = [90.0] * IPAM_COLS
-    devices = sorted(
-        (k for k in port_details if k in topo.devices),
-        key=lambda k: topo.devices[k].hostname or k)
-    for key in devices:
-        rows = _ipam_rows(port_details[key])
-        if not rows:
-            continue
-        dev = topo.devices[key]
-        body = "".join(
-            "<tr>" + "".join(
-                f"<td style='padding:2px 6px;border:1px solid #ccc;'>"
-                f"{cell}</td>" for cell in row) + "</tr>"
-            for row in rows)
-        html = (
-            f"<b>{dev.hostname or key}</b>"
-            f"<span style='color:#666;'> {dev.mgmt_ip}</span>"
-            f"<table style='border-collapse:collapse;margin-top:4px;"
-            f"width:100%;'>"
-            f"<tr><th style='padding:2px 6px;border:1px solid #999;"
-            f"background:#eee;'>Interface</th>"
-            f"<th style='padding:2px 6px;border:1px solid #999;"
-            f"background:#eee;'>VLAN</th>"
-            f"<th style='padding:2px 6px;border:1px solid #999;"
-            f"background:#eee;'>IP</th>"
-            f"<th style='padding:2px 6px;border:1px solid #999;"
-            f"background:#eee;'>VRF</th></tr>{body}</table>")
-        h = 44.0 + IPAM_ROW_H * (len(rows) + 1)
-        col = min(range(IPAM_COLS), key=lambda c: col_heights[c])
-        x = 60.0 + col * (IPAM_W + 40) + IPAM_W / 2
-        y = col_heights[col] + h / 2
-        xb.node(parent, html, IPAM_NODE_STYLE, x, y, w=IPAM_W, h=h)
-        col_heights[col] += h + 30.0
+def write_ipam_csv(path: str, topo: Topology,
+                   port_details: dict[str, dict[str, "PortInfo"]]) -> int:
+    """Flat addressing inventory: one row per configured address.
+
+    Columns: hostname, mgmt_ip, interface, vlan, ip, prefix, network,
+    vrf. The network column makes 'everything on this subnet' a single
+    filter in Excel or a grep on the CLI.
+    """
+    count = 0
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["hostname", "mgmt_ip", "interface", "vlan",
+                    "ip", "prefix", "network", "vrf"])
+        for key in sorted(port_details,
+                          key=lambda k: (topo.devices[k].hostname or k)
+                          if k in topo.devices else k):
+            dev = topo.devices.get(key)
+            if dev is None:
+                continue
+            for ifname, vlan, addr, vrf in _ipam_rows(port_details[key]):
+                try:
+                    iface = ipaddress.ip_interface(addr)
+                    ip_s = str(iface.ip)
+                    prefix = str(iface.network.prefixlen)
+                    network = str(iface.network)
+                except ValueError:
+                    ip_s, prefix, network = addr, "", ""
+                w.writerow([dev.hostname or key, dev.mgmt_ip, ifname,
+                            vlan, ip_s, prefix, network, vrf])
+                count += 1
+    return count
 
 
 def build_split_pages(topo: Topology, info: "ScopeInfo",
                       l2_edges, l3_segments, routing_adjs, vsx_pairs,
                       detail_small: bool = True):
-    """Return [(name, page_id, render_fn), ...] for area-split output."""
+    """Area-grouped tabs: Overview, Core L3, then per area (Core-Agg
+    first, then each block) L1 / L2 / L3 / IPAM adjacent, so reviewing
+    walks one area completely before the next."""
     pages = []
     l2_edges = l2_edges or []
     l3_segments = l3_segments or []
@@ -1840,15 +1860,39 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
     members: dict[int, set] = {b: set() for b in blocks}
     for k, b in info.block.items():
         members[b].add(k)
-    # endpoints ride with their attached switch's block
     ep_block: dict[str, int] = {}
     for e in topo.edges.values():
         for k, other in ((e.a_key, e.b_key), (e.b_key, e.a_key)):
             if k not in info.tier and other in info.block:
                 ep_block[k] = info.block[other]
     core = set(info.core_keys)
+    aggs = {k for k, t in info.tier.items() if t == 1}
 
-    # ---- Overview: cores + one node per block, aggregated uplinks ------
+    def l2_scope(e):
+        return _scope_of_pair(info, e.a_key, e.b_key)
+
+    def seg_scope(seg):
+        mk = list(seg.members)
+        if len(mk) == 1:
+            k = mk[0]
+            if k in core:
+                return ("core",)
+            b = info.block.get(k)
+            return ("block", b) if b is not None else ("coreagg",)
+        scopes = {_scope_of_pair(info, a, b)
+                  for a in mk for b in mk if a < b}
+        return scopes.pop() if len(scopes) == 1 else ("coreagg",)
+
+    def adj_scope(a):
+        if a.b_external:
+            k = a.a_key
+            if k in core:
+                return ("core",)
+            b = info.block.get(k)
+            return ("block", b) if b is not None else ("coreagg",)
+        return _scope_of_pair(info, a.a_key, a.b_key)
+
+    # ---- Overview ------------------------------------------------------
     def render_overview(xb):
         sub = _sub_topology(topo, core)
         pos = _layout(sub, vsx_pairs)
@@ -1861,7 +1905,6 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
             xb.edge("1", "", EDGE_STYLE, ids[e.a_key], ids[e.b_key],
                     src_label=e.a_port, dst_label=e.b_port)
         cy = max((p[1] for p in pos.values()), default=150) + TIER_H
-        xs = sorted(pos.values())
         cx0 = min((p[0] for p in pos.values()), default=200) - UNIT_W
         counts: dict[tuple, int] = {}
         for e in topo.edges.values():
@@ -1886,68 +1929,7 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
 
     pages.append(("Overview", "page-overview", render_overview))
 
-    # ---- Per-block physical (with ghost cores for uplink context) ------
-    for bid in blocks:
-        keys = members[bid] | core | {k for k, b in ep_block.items()
-                                      if b == bid}
-        sub = _sub_topology(topo, keys)
-
-        def render_phys(xb, sub=sub):
-            pos = _layout(sub, vsx_pairs)
-            _render_physical(xb, "1", sub, pos, vsx_pairs,
-                             detail=detail_small)
-        pages.append((f"{info.block_label[bid]} - Physical",
-                      f"page-phys-b{bid}", render_phys))
-
-    # ---- L2 pages -------------------------------------------------------
-    def l2_scope(e):
-        return _scope_of_pair(info, e.a_key, e.b_key)
-
-    l2_core = [e for e in l2_edges if l2_scope(e)[0] in ("core", "coreagg")]
-    if l2_core:
-        def render_l2core(xb, edges=l2_core):
-            keys = {e.a_key for e in edges} | {e.b_key for e in edges}
-            sub = _sub_topology(topo, keys)
-            pos = _layout(sub, vsx_pairs)
-            _render_l2(xb, "1", sub, pos, edges, vsx_pairs,
-                       detail=detail_small)
-        pages.append(("Core/Agg - L2", "page-l2-core", render_l2core))
-    for bid in blocks:
-        edges = [e for e in l2_edges if l2_scope(e) == ("block", bid)]
-        if not edges:
-            continue
-
-        def render_l2b(xb, edges=edges):
-            keys = {e.a_key for e in edges} | {e.b_key for e in edges}
-            sub = _sub_topology(topo, keys)
-            pos = _layout(sub, vsx_pairs)
-            _render_l2(xb, "1", sub, pos, edges, vsx_pairs,
-                       detail=detail_small)
-        pages.append((f"{info.block_label[bid]} - L2",
-                      f"page-l2-b{bid}", render_l2b))
-
-    # ---- Routed pages: L3 segments + routing adjacencies together ------
-    def seg_scope(seg):
-        mk = list(seg.members)
-        if len(mk) == 1:
-            k = mk[0]
-            if k in core:
-                return ("core",)
-            b = info.block.get(k)
-            return ("block", b) if b is not None else ("coreagg",)
-        scopes = {_scope_of_pair(info, a, b)
-                  for a in mk for b in mk if a < b}
-        return scopes.pop() if len(scopes) == 1 else ("coreagg",)
-
-    def adj_scope(a):
-        if a.b_external:
-            k = a.a_key
-            if k in core:
-                return ("core",)
-            b = info.block.get(k)
-            return ("block", b) if b is not None else ("coreagg",)
-        return _scope_of_pair(info, a.a_key, a.b_key)
-
+    # ---- Core L3 (core-only routed relations) --------------------------
     def routed_page(name, pid, segs, adjs):
         if not segs and not adjs:
             return
@@ -1967,15 +1949,50 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
                 _render_routing(xb, "1", sub, pos, adjs, bow_offset=45.0)
         pages.append((name, pid, render))
 
-    routed_page("Core - Routed", "page-rt-core",
+    routed_page("Core L3", "page-l3-core",
                 [s for s in l3_segments if seg_scope(s) == ("core",)],
                 [a for a in routing_adjs if adj_scope(a) == ("core",)])
-    routed_page("Core/Agg - Routed", "page-rt-coreagg",
+
+    # ---- Area page sets: Core-Agg first, then each block ---------------
+    def l2_page(name, pid, edges):
+        if not edges:
+            return
+        def render(xb, edges=edges):
+            keys = {e.a_key for e in edges} | {e.b_key for e in edges}
+            sub = _sub_topology(topo, keys)
+            pos = _layout(sub, vsx_pairs)
+            _render_l2(xb, "1", sub, pos, edges, vsx_pairs,
+                       detail=detail_small)
+        pages.append((name, pid, render))
+
+    # Core-Agg area: full core<->distribution cabling as its own L1.
+    def render_coreagg_l1(xb):
+        keys = core | aggs
+        sub = _sub_topology(topo, keys)
+        pos = _layout(sub, vsx_pairs)
+        _render_physical(xb, "1", sub, pos, vsx_pairs,
+                         detail=detail_small)
+    pages.append(("Core-Agg L1", "page-l1-coreagg", render_coreagg_l1))
+    l2_page("Core-Agg L2", "page-l2-coreagg",
+            [e for e in l2_edges if l2_scope(e)[0] in ("core", "coreagg")])
+    routed_page("Core-Agg L3", "page-l3-coreagg",
                 [s for s in l3_segments if seg_scope(s) == ("coreagg",)],
                 [a for a in routing_adjs if adj_scope(a) == ("coreagg",)])
+
     for bid in blocks:
-        routed_page(f"{info.block_label[bid]} - Routed",
-                    f"page-rt-b{bid}",
+        blk = info.block_label[bid]
+        keys = members[bid] | core | {k for k, b in ep_block.items()
+                                      if b == bid}
+        sub = _sub_topology(topo, keys)
+
+        def render_phys(xb, sub=sub):
+            pos = _layout(sub, vsx_pairs)
+            _render_physical(xb, "1", sub, pos, vsx_pairs,
+                             detail=detail_small)
+        pages.append((f"{blk} L1", f"page-l1-b{bid}", render_phys))
+        l2_page(f"{blk} L2", f"page-l2-b{bid}",
+                [e for e in l2_edges if l2_scope(e) == ("block", bid)])
+        routed_page(f"{blk} L3", f"page-l3-b{bid}",
                     [s for s in l3_segments
                      if seg_scope(s) == ("block", bid)],
                     [a for a in routing_adjs
@@ -2002,9 +2019,7 @@ def to_drawio_xml(topo: Topology,
                   layout: str = "tiered",
                   core_hints: list[str] | None = None,
                   force_detail: bool = False,
-                  split: str = "auto",
-                  port_details: dict[str, dict[str, PortInfo]] | None = None
-                  ) -> str:
+                  split: str = "auto") -> str:
     """Emit a draw.io file with one view per PAGE (default) or as
     toggleable layers on a single page (layered=True).
 
@@ -2065,10 +2080,6 @@ def to_drawio_xml(topo: Topology,
                     topo, info, l2_edges, l3_segments, routing_adjs,
                     vsx_pairs, detail_small=True):
                 page(name, pid, render)
-            if port_details and any(_ipam_rows(d)
-                                    for d in port_details.values()):
-                page("IPAM", "page-ipam",
-                     lambda xb: _render_ipam(xb, "1", topo, port_details))
             diagrams = "\n".join(
                 f'  <diagram name="{escape(name)}" id="{page_id}">\n'
                 + _GRAPH_MODEL.format(body=body)
@@ -2092,10 +2103,6 @@ def to_drawio_xml(topo: Topology,
             page("Routing", "page-rtg",
                  lambda xb: _render_routing(xb, "1", topo, pos,
                                             routing_adjs))
-        if port_details and any(_ipam_rows(d)
-                                for d in port_details.values()):
-            page("IPAM", "page-ipam",
-                 lambda xb: _render_ipam(xb, "1", topo, port_details))
 
     diagrams = "\n".join(
         f'  <diagram name="{escape(name)}" id="{page_id}">\n'
@@ -2203,6 +2210,11 @@ def main(argv: list[str] | None = None) -> int:
                            "e.g. topology.json). Needed for diff mode.")
     scan.add_argument("--no-json", action="store_true",
                       help="skip writing the JSON inventory")
+    scan.add_argument("--ipam", metavar="FILE",
+                      help="IPAM CSV path (default: ip-addressing.csv "
+                           "alongside the -o output)")
+    scan.add_argument("--no-ipam", action="store_true",
+                      help="skip writing the IPAM CSV")
     scan.add_argument("--api-version", default=DEFAULT_API_VERSION,
                       help="'auto' negotiates the latest version via GET "
                            "/rest (v10.16 on 10.16 firmware); or pin one, "
@@ -2394,11 +2406,23 @@ def run_scan(args) -> int:
                               layered=args.layered,
                               layout=args.layout, core_hints=args.core,
                               force_detail=args.detail_labels,
-                              split=args.split,
-                              port_details=details_by_dev))
+                              split=args.split))
     log.info("draw.io diagram written to %s (%s)", args.output,
          "layers: View > Layers" if args.layered
          else "one page per view — tabs at the bottom")
+
+    if details_by_dev and not args.no_ipam:
+        ipam_path = args.ipam
+        if not ipam_path:
+            out_dir = os.path.dirname(args.output)
+            ipam_path = os.path.join(out_dir, "ip-addressing.csv") \
+                if out_dir else "ip-addressing.csv"
+        n_rows = write_ipam_csv(ipam_path, topo, details_by_dev)
+        if n_rows:
+            log.info("IPAM CSV written to %s (%d addresses)",
+                     ipam_path, n_rows)
+        else:
+            os.remove(ipam_path)
 
     if not args.no_json:
         json_path = args.json
