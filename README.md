@@ -186,8 +186,18 @@ switch. Rows are barycentre-ordered to keep access switches under
 their own aggregation and minimise crossing links. If auto-detection
 picks the wrong core on an unusual topology, pin it with `--core
 <hostname-or-IP>` (repeatable); `--layout circle` restores the original
-radial layout. Port labels and pages survive manual re-arrangement in
-draw.io.
+radial layout. Below each tier, switches are
+clustered into distribution blocks under their own parent pair, with
+gaps between blocks and parents aligned directly above their children.
+Port labels and pages survive manual re-arrangement in draw.io.
+
+**Large estates.** Above 15 switches, per-end interface labels move to
+hover tooltips automatically (hover any link to see its ports); force
+printed labels with `--detail-labels`. On the Routing page, OSPF areas
+and iBGP meshes spanning three or more switches collapse into a
+protocol hub with one spoke per member — an 8-switch iBGP full mesh
+renders as 8 spokes instead of 28 pairwise edges. eBGP and external
+peerings stay as direct edges.
 
 ## Tests
 

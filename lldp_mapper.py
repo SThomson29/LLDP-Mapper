@@ -1136,22 +1136,109 @@ def _layout_tiered(topo: Topology,
                     for n in unit:
                         slot[n] = float(i)
 
-        # Assign coordinates, rows centred on the widest row.
-        widths = {t: sum(2 if len(u) == 2 else 1 for u in unit_rows[t])
-                  for t in unit_rows}
-        max_w = max(widths.values())
+        # Distribution-block grouping: below the core tier, cluster each
+        # unit under its dominant parent unit (most uplinks), keep blocks
+        # in the parents' order, then align parents over their children
+        # bottom-up (classic tree layout) so each agg pair sits directly
+        # above its own access block.
+        min_t, max_t = min(unit_rows), max(unit_rows)
+        parent_unit_idx: dict[str, int] = {}
+        for i, unit in enumerate(unit_rows[min_t]):
+            for n in unit:
+                parent_unit_idx[n] = i
+        group_of: dict[int, dict[int, list[list[str]]]] = {}
         for t in sorted(unit_rows):
-            x = comp_x0 + (max_w - widths[t]) * UNIT_W / 2
-            y = top_y + t * TIER_H
+            if t == min_t:
+                continue
+            groups: dict[int, list[list[str]]] = {}
             for unit in unit_rows[t]:
-                if len(unit) == 2:
-                    pos[unit[0]] = (x + UNIT_W * 0.5, y)
-                    pos[unit[1]] = (x + UNIT_W * 1.5, y)
-                    x += 2 * UNIT_W
+                votes: dict[int, int] = {}
+                for n in unit:
+                    for m in adj[n]:
+                        if depths.get(m, 99) == t - 1:
+                            pi = parent_unit_idx.get(m)
+                            if pi is not None:
+                                votes[pi] = votes.get(pi, 0) + 1
+                best = (min(votes, key=lambda k: (-votes[k], k))
+                        if votes else 10**6)
+                groups.setdefault(best, []).append(unit)
+            ordered: list[list[str]] = []
+            for gi in sorted(groups):
+                ordered.extend(groups[gi])
+            unit_rows[t] = ordered
+            group_of[t] = groups
+            for i, unit in enumerate(ordered):
+                for n in unit:
+                    parent_unit_idx[n] = i
+
+        BLOCK_GAP = UNIT_W * 0.7
+
+        def unit_w(u) -> float:
+            return (2 if len(u) == 2 else 1) * UNIT_W
+
+        # Deepest row: sequential, gap between blocks.
+        centre: dict[int, list[float]] = {}
+        x = 0.0
+        boundaries: set[int] = set()
+        if max_t in group_of:
+            acc = 0
+            for gi in sorted(group_of[max_t])[:-1]:
+                acc += len(group_of[max_t][gi])
+                boundaries.add(acc)
+        centre[max_t] = []
+        for i, unit in enumerate(unit_rows[max_t]):
+            if i in boundaries:
+                x += BLOCK_GAP
+            centre[max_t].append(x + unit_w(unit) / 2)
+            x += unit_w(unit)
+
+        # Upper rows: parent over the mean of its children, collisions
+        # pushed right, then the row is nudged back to balance.
+        for t in range(max_t - 1, min_t - 1, -1):
+            child_groups = group_of.get(t + 1, {})
+            desired = []
+            for i, unit in enumerate(unit_rows[t]):
+                kids = child_groups.get(i, [])
+                if kids:
+                    idxs = [unit_rows[t + 1].index(u) for u in kids]
+                    desired.append(sum(centre[t + 1][j] for j in idxs)
+                                   / len(idxs))
                 else:
-                    pos[unit[0]] = (x + UNIT_W / 2, y)
-                    x += UNIT_W
-        comp_x0 += (max_w + 1.5) * UNIT_W
+                    desired.append(None)
+            row: list[float] = []
+            for i, unit in enumerate(unit_rows[t]):
+                want = desired[i]
+                minimum = (row[-1] + unit_w(unit_rows[t][i - 1]) / 2
+                           + unit_w(unit) / 2 + 20) if row else -1e18
+                if want is None:
+                    want = minimum if row else 0.0
+                row.append(max(want, minimum))
+            # If collisions pushed the row right of its targets, shift
+            # the whole row back by the mean overshoot.
+            offsets = [r - d for r, d in zip(row, desired)
+                       if d is not None]
+            if offsets:
+                shift = sum(offsets) / len(offsets)
+                row = [r - shift for r in row]
+            centre[t] = row
+
+        # Emit coordinates, normalised so the component starts at comp_x0.
+        min_x = min(c - unit_w(u) / 2
+                    for t in unit_rows
+                    for c, u in zip(centre[t], unit_rows[t]))
+        span = max(c + unit_w(u) / 2
+                   for t in unit_rows
+                   for c, u in zip(centre[t], unit_rows[t])) - min_x
+        for t in sorted(unit_rows):
+            y = top_y + t * TIER_H
+            for c, unit in zip(centre[t], unit_rows[t]):
+                cx = comp_x0 + (c - min_x)
+                if len(unit) == 2:
+                    pos[unit[0]] = (cx - UNIT_W / 2, y)
+                    pos[unit[1]] = (cx + UNIT_W / 2, y)
+                else:
+                    pos[unit[0]] = (cx, y)
+        comp_x0 += span + 1.5 * UNIT_W
 
     # Endpoints: fanned directly below their attached switch.
     per_switch: dict[str, int] = {}
@@ -1262,6 +1349,14 @@ SUBNET_STYLE = (
 )
 OSPF_EDGE_STYLE = EDGE_STYLE + "strokeColor=#d79b00;strokeWidth=2;curved=1;"
 BGP_EDGE_STYLE = EDGE_STYLE + "strokeColor=#9673a6;strokeWidth=2;curved=1;"
+OSPF_HUB_STYLE = (
+    "ellipse;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;"
+    "fontFamily=Helvetica;fontSize=10;align=center;"
+)
+BGP_HUB_STYLE = (
+    "ellipse;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;"
+    "fontFamily=Helvetica;fontSize=10;align=center;"
+)
 EXTERNAL_STYLE = (
     "rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;"
     "fontFamily=Helvetica;fontSize=10;align=center;dashed=1;"
@@ -1314,8 +1409,13 @@ class _XmlBuilder:
     def edge(self, layer: str, label: str, style: str,
              src: str, dst: str,
              src_label: str = "", dst_label: str = "",
-             waypoint: tuple[float, float] | None = None) -> None:
+             waypoint: tuple[float, float] | None = None,
+             labels_as_tooltip: bool = False) -> None:
         """Draw an edge; optional src/dst labels render at each end.
+
+        With labels_as_tooltip, end labels become a hover tooltip on
+        the edge instead of printed text — used automatically on large
+        estates where printed port labels make the overview unreadable.
 
         End labels are draw.io child cells parented to the edge with
         relative geometry: x=-0.75 sits near the source node, x=+0.75
@@ -1331,6 +1431,16 @@ class _XmlBuilder:
         if waypoint is not None:
             wp = (f'<Array as="points"><mxPoint x="{waypoint[0]:.0f}" '
                   f'y="{waypoint[1]:.0f}"/></Array>')
+        if labels_as_tooltip and (src_label or dst_label):
+            tip = f"{src_label} \u2194 {dst_label}".strip(" \u2194 ")
+            self.cells.append(
+                f'<object label="{self._esc(label)}" '
+                f'tooltip="{self._esc(tip)}" id="{eid}">'
+                f'<mxCell style="{style}" edge="1" parent="{layer}" '
+                f'source="{src}" target="{dst}">'
+                f'<mxGeometry relative="1" as="geometry">{wp}</mxGeometry>'
+                f'</mxCell></object>')
+            return
         self.cells.append(
             f'<mxCell id="{eid}" value="{self._esc(label)}" style="{style}" '
             f'edge="1" parent="{layer}" source="{src}" target="{dst}">'
@@ -1382,9 +1492,13 @@ def _vsx_boxes(xb: "_XmlBuilder", parent: str, pos: dict,
                 w=(x1 - x0) + 30, h=(y1 - y0) + 54)
 
 
+DETAIL_LABEL_MAX_SWITCHES = 15
+
+
 def _render_physical(xb: "_XmlBuilder", parent: str, topo: Topology,
                      pos: dict,
-                     vsx_pairs: list[tuple[str, str]] | None) -> None:
+                     vsx_pairs: list[tuple[str, str]] | None,
+                     detail: bool = True) -> None:
     _vsx_boxes(xb, parent, pos, vsx_pairs, set(topo.devices))
     ids: dict[str, str] = {}
     for key, dev in topo.devices.items():
@@ -1395,13 +1509,14 @@ def _render_physical(xb: "_XmlBuilder", parent: str, topo: Topology,
         src, dst = ids.get(edge.a_key), ids.get(edge.b_key)
         if src and dst:
             xb.edge(parent, "", EDGE_STYLE, src, dst,
-                    src_label=edge.a_port, dst_label=edge.b_port)
+                    src_label=edge.a_port, dst_label=edge.b_port,
+                    labels_as_tooltip=not detail)
 
 
 def _render_l2(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
                l2_edges: list[L2Edge],
                vsx_pairs: list[tuple[str, str]] | None,
-               bow_offset: float = 0.0) -> None:
+               bow_offset: float = 0.0, detail: bool = True) -> None:
     l2_devs = {e.a_key for e in l2_edges} | {e.b_key for e in l2_edges}
     _vsx_boxes(xb, parent, pos, vsx_pairs, l2_devs)
     ids: dict[str, str] = {}
@@ -1423,12 +1538,13 @@ def _render_l2(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
         xb.edge(parent, "\n".join(bits), L2_EDGE_STYLE,
                 ids[e.a_key], ids[e.b_key],
                 src_label=e.a_if, dst_label=e.b_if,
-                waypoint=_bow(pos, e.a_key, e.b_key, bow_offset))
+                waypoint=_bow(pos, e.a_key, e.b_key, bow_offset),
+                labels_as_tooltip=not detail)
 
 
 def _render_l3(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
                l3_segments: list[L3Segment],
-               bow_offset: float = 0.0) -> None:
+               bow_offset: float = 0.0, detail: bool = True) -> None:
     ids: dict[str, str] = {}
     l3_devs = {k for seg in l3_segments for k in seg.members}
     for key in l3_devs:
@@ -1459,7 +1575,8 @@ def _render_l3(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
             a, b = members
             xb.edge(parent, seg.label, L3_EDGE_STYLE, ids[a], ids[b],
                     src_label=seg.members[a], dst_label=seg.members[b],
-                    waypoint=_bow(pos, a, b, bow_offset))
+                    waypoint=_bow(pos, a, b, bow_offset),
+                    labels_as_tooltip=not detail)
         else:
             xs = [pos[k][0] for k in members]
             ys = [pos[k][1] for k in members]
@@ -1488,7 +1605,41 @@ def _render_routing(xb: "_XmlBuilder", parent: str, topo: Topology,
             parent, f"{ip}\n(external peer)", EXTERNAL_STYLE,
             200 + (j % 4) * (NODE_W + 60),
             80 + (j // 4) * (NODE_H + 40))
+    # Group internal adjacencies (both ends in inventory) by protocol
+    # domain — an OSPF area or an iBGP AS. Domains spanning 3+ devices
+    # render as a hub with one spoke per member instead of a pairwise
+    # mesh (an N-member iBGP mesh is N spokes, not N*(N-1)/2 edges).
+    HUB_MIN_MEMBERS = 3
+    domains: dict[tuple, set[str]] = {}
+    direct: list[RoutingAdj] = []
     for adj in routing_adjs:
+        if adj.b_key and (adj.protocol == "ospf"
+                          or adj.detail.startswith("iBGP")):
+            key = (adj.protocol, adj.vrf, adj.detail)
+            domains.setdefault(key, set()).update((adj.a_key, adj.b_key))
+        else:
+            direct.append(adj)
+    for (proto, vrf, det), members in sorted(domains.items()):
+        members = {m for m in members if m in ids}
+        if len(members) < HUB_MIN_MEMBERS:
+            direct.extend(a for a in routing_adjs
+                          if (a.protocol, a.vrf, a.detail) == (proto, vrf,
+                                                               det)
+                          and a.b_key)
+            continue
+        label = det if proto == "bgp" else f"OSPF {det}"
+        if vrf != "default":
+            label += f"\nvrf {vrf}"
+        xs = [pos[m][0] for m in members if m in pos]
+        ys = [pos[m][1] for m in members if m in pos]
+        hub_style = OSPF_HUB_STYLE if proto == "ospf" else BGP_HUB_STYLE
+        spoke_style = (OSPF_EDGE_STYLE if proto == "ospf"
+                       else BGP_EDGE_STYLE)
+        hub = xb.node(parent, label, hub_style,
+                      sum(xs) / len(xs), sum(ys) / len(ys), w=170, h=55)
+        for m in sorted(members):
+            xb.edge(parent, "", spoke_style, ids[m], hub)
+    for adj in direct:
         src = ids.get(adj.a_key)
         dst = ids.get(adj.b_key or f"ext:{adj.b_external}")
         if not (src and dst):
@@ -1517,7 +1668,8 @@ def to_drawio_xml(topo: Topology,
                   vsx_pairs: list[tuple[str, str]] | None = None,
                   layered: bool = False,
                   layout: str = "tiered",
-                  core_hints: list[str] | None = None) -> str:
+                  core_hints: list[str] | None = None,
+                  force_detail: bool = False) -> str:
     """Emit a draw.io file with one view per PAGE (default) or as
     toggleable layers on a single page (layered=True).
 
@@ -1528,20 +1680,26 @@ def to_drawio_xml(topo: Topology,
     side-by-side comparison, at the cost of visual density.
     """
     pos = _layout(topo, vsx_pairs, layout, core_hints)
+    n_switches = sum(1 for d in topo.devices.values() if d.is_switch)
+    detail = force_detail or n_switches <= DETAIL_LABEL_MAX_SWITCHES
+    if not detail:
+        log.info("%d switches > %d: interface labels moved to hover "
+                 "tooltips (force with --detail-labels)",
+                 n_switches, DETAIL_LABEL_MAX_SWITCHES)
 
     if layered:
         xb = _XmlBuilder()
         xb.layer("lyr_phys", "1 - Physical (LLDP)", visible=True)
-        _render_physical(xb, "lyr_phys", topo, pos, vsx_pairs)
+        _render_physical(xb, "lyr_phys", topo, pos, vsx_pairs, detail)
         if l2_edges:
             xb.layer("lyr_l2", "2 - Layer 2 (LAGs / VLANs)", visible=False)
             _render_l2(xb, "lyr_l2", topo, pos, l2_edges, vsx_pairs,
-                       bow_offset=30.0)
+                       bow_offset=30.0, detail=detail)
         if l3_segments:
             xb.layer("lyr_l3", "3 - Layer 3 (subnets / VRFs)",
                      visible=False)
             _render_l3(xb, "lyr_l3", topo, pos, l3_segments,
-                       bow_offset=-30.0)
+                       bow_offset=-30.0, detail=detail)
         if routing_adjs:
             xb.layer("lyr_rtg", "4 - Routing (OSPF / BGP)", visible=False)
             _render_routing(xb, "lyr_rtg", topo, pos, routing_adjs,
@@ -1559,14 +1717,16 @@ def to_drawio_xml(topo: Topology,
                           "\n        ".join(xb.cells)))
 
         page("Physical", "page-phys",
-             lambda xb: _render_physical(xb, "1", topo, pos, vsx_pairs))
+             lambda xb: _render_physical(xb, "1", topo, pos, vsx_pairs,
+                                         detail))
         if l2_edges:
             page("Layer 2", "page-l2",
                  lambda xb: _render_l2(xb, "1", topo, pos, l2_edges,
-                                       vsx_pairs))
+                                       vsx_pairs, detail=detail))
         if l3_segments:
             page("Layer 3", "page-l3",
-                 lambda xb: _render_l3(xb, "1", topo, pos, l3_segments))
+                 lambda xb: _render_l3(xb, "1", topo, pos, l3_segments,
+                                       detail=detail))
         if routing_adjs:
             page("Routing", "page-rtg",
                  lambda xb: _render_routing(xb, "1", topo, pos,
@@ -1686,6 +1846,10 @@ def main(argv: list[str] | None = None) -> int:
                       help="include subnets attached to only one switch "
                            "(SVIs, uplink /30s) as leaf nodes on the L3 "
                            "page — needed for single-switch/stack estates")
+    scan.add_argument("--detail-labels", action="store_true",
+                      help="always print interface labels at edge ends; "
+                           "by default estates over %d switches move them "
+                           "to hover tooltips" % 15)
     scan.add_argument("--layout", choices=["tiered", "circle"],
                       default="tiered",
                       help="tiered (core top, hierarchy below; default) "
@@ -1856,7 +2020,8 @@ def run_scan(args) -> int:
         f.write(to_drawio_xml(topo, l2_edges, l3_segments,
                               routing_adjs, vsx_pairs,
                               layered=args.layered,
-                              layout=args.layout, core_hints=args.core))
+                              layout=args.layout, core_hints=args.core,
+                              force_detail=args.detail_labels))
     log.info("draw.io diagram written to %s (%s)", args.output,
          "layers: View > Layers" if args.layered
          else "one page per view — tabs at the bottom")
