@@ -67,7 +67,7 @@ assert not any(s.network.endswith("/32") for s in l3)
 print(f"L3 segments OK ({len(l3)} segments)")
 
 # --- layered XML --------------------------------------------------------------
-xml = to_drawio_xml(topo, l2, l3)
+xml = to_drawio_xml(topo, l2, l3, layered=True)
 root = ET.fromstring(xml)
 layers = {c.get("id"): c for c in root.findall(".//mxCell")
           if c.get("parent") == "0" and c.get("id") != "0"}
@@ -97,3 +97,17 @@ print("layered XML OK (3 layers, correct visibility, edges scoped per layer)")
 with open("sample_layered.drawio", "w") as f:
     f.write(xml)
 print("sample written")
+
+# --- multi-layer overlay: L2/L3 edges bow away from physical -----------------
+def edges_of(layer):
+    return [c for c in cells if c.get("parent") == layer and c.get("edge")]
+def has_waypoint(e):
+    return e.find("mxGeometry/Array/mxPoint") is not None
+assert not any(has_waypoint(e) for e in edges_of("lyr_phys"))
+assert all(has_waypoint(e) for e in edges_of("lyr_l2"))
+# L3: p2p edges bow; hub spokes don't need to
+l3_wp = [e for e in edges_of("lyr_l3") if has_waypoint(e)]
+assert len(l3_wp) >= 1
+# L2 and L3 bow to opposite sides of the same link where both exist
+assert "curved=1" in edges_of("lyr_l2")[0].get("style", "")
+print("layer overlay bowing OK (phys straight, L2/L3 curved with waypoints)")

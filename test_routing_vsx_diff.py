@@ -76,7 +76,7 @@ print(f"routing adjacency OK (1 OSPF, 1 iBGP, 1 external eBGP from "
 # --- four-layer XML with VSX boxes --------------------------------------------
 l2 = build_l2_edges(topo, details_by_dev)
 l3 = build_l3_segments(details_by_dev)
-xml = to_drawio_xml(topo, l2, l3, adjs, pairs)
+xml = to_drawio_xml(topo, l2, l3, adjs, pairs, layered=True)
 root = ET.fromstring(xml)
 cells = root.findall(".//mxCell")
 layers = {c.get("id") for c in cells if c.get("parent") == "0"

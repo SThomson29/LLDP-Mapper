@@ -24,17 +24,26 @@ python3 lldp_mapper.py scan 10.20.30.0/24 -u admin \
 ```
 
 Open `topology.drawio` in [draw.io](https://app.diagrams.net) or the
-desktop app, then use **View → Layers** to switch between views.
+desktop app. Each view is a **page** — tabs along the bottom of the
+canvas — with identical node positions, so flipping tabs reads like
+toggling views without any overlap. Pass `--layered` for the older
+single-page mode with toggleable layers (View → Layers) if you want
+views overlaid for comparison.
 The bare form `python3 lldp_mapper.py 10.20.30.0/24 -u admin` also works
 (`scan` is implied).
 
 ## What you get
 
-The diagram contains up to four layers, all sharing the same node
-positions so devices stay put as you toggle:
+The diagram contains up to four views (pages by default, or layers
+with `--layered`), all sharing the same node positions so devices stay
+put as you switch. In layered mode, edges are additionally bowed per
+layer — physical straight, L2 one side, L3 the other, routing further
+out — to reduce overprinting when several layers are visible at once.
 
 **1 — Physical (LLDP)** — visible on open. One edge per discovered
-cable, labelled `local-port ↔ remote-port`. VSX pairs are placed side
+cable, with each port number rendered at its own end of the link —
+beside the switch it belongs to — so there is no ambiguity about
+which port is which. VSX pairs are placed side
 by side inside a dashed container with their role (primary/secondary)
 in the node label. Add `--include-endpoints` to also show APs, phones,
 and servers seen in LLDP as dashed grey leaf nodes.
@@ -79,6 +88,7 @@ during migrations.
 |---|---|---|
 | `-o, --output` | `topology.drawio` | draw.io output path |
 | `--json FILE` | off | also write JSON inventory (needed for diff) |
+| `--layered` | off | single page with toggleable layers instead of one page per view |
 | `--include-endpoints` | off | show non-switch LLDP neighbours |
 | `--physical-only` | off | skip L2/L3/routing collection entirely |
 | `--no-routing` | off | keep L2/L3 but skip the OSPF/BGP walks |
@@ -130,6 +140,7 @@ Offline suites run against synthetic fixtures — no switches needed:
 python3 test_mapper.py            # parsing, dedup, physical XML
 python3 test_layers.py            # L2 aggregation, L3 segments, layers
 python3 test_routing_vsx_diff.py  # VSX pairing, OSPF/BGP, diff mode
+python3 test_pages.py             # multi-page output
 ```
 
 The shared fixture (`test_mapper_common.py`) models a VSX core pair

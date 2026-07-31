@@ -113,7 +113,8 @@ print("MAC dedup OK")
 xml = to_drawio_xml(topo2)
 root = ET.fromstring(xml)
 cells = root.findall(".//mxCell")
-vertices = [c for c in cells if c.get("vertex") == "1"]
+vertices = [c for c in cells if c.get("vertex") == "1"
+            and c.get("connectable") != "0"]  # exclude edge-end labels
 edges = [c for c in cells if c.get("edge") == "1"]
 assert len(vertices) == 6, len(vertices)
 assert len(edges) == 6, len(edges)
@@ -121,9 +122,15 @@ assert len(edges) == 6, len(edges)
 vids = {c.get("id") for c in vertices}
 for e in edges:
     assert e.get("source") in vids and e.get("target") in vids
-# port labels present
-labels = {e.get("value") for e in edges}
-assert any("1/1/49" in l for l in labels)
+# port labels present at edge ends (child cells parented to edges)
+eids = {e.get("id") for e in edges}
+end_labels = [c for c in cells if c.get("connectable") == "0"
+              and c.get("parent") in eids]
+assert any("1/1/49" in (c.get("value") or "") for c in end_labels)
+# each end label anchors to a real edge and sits at +/-0.75
+for c in end_labels:
+    g = c.find("mxGeometry")
+    assert float(g.get("x")) in (-0.75, 0.75)
 print("draw.io XML OK (parsed, all edges reference valid nodes)")
 
 with open("/home/claude/lldp-mapper/sample_topology.drawio", "w") as f:

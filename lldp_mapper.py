@@ -752,7 +752,7 @@ def build_l3_segments(details_by_dev: dict[str, dict[str, PortInfo]]
                 seg = segments.setdefault(
                     seg_key, L3Segment(vrf=p.vrf,
                                        network=str(iface.network)))
-                detail = f"{p.name} {iface.ip}"
+                detail = f"{p.name} \u00b7 {iface.ip}"
                 if p.is_svi and p.svi_vlan is not None:
                     detail = f"vlan {p.svi_vlan} · {iface.ip}"
                 seg.members[dev_key] = detail
@@ -1028,14 +1028,14 @@ def _layout(topo: Topology,
     return pos
 
 
-L2_EDGE_STYLE = EDGE_STYLE + "strokeWidth=2;strokeColor=#6c8ebf;"
-L3_EDGE_STYLE = EDGE_STYLE + "strokeColor=#82b366;dashed=1;"
+L2_EDGE_STYLE = EDGE_STYLE + "strokeWidth=2;strokeColor=#6c8ebf;curved=1;"
+L3_EDGE_STYLE = EDGE_STYLE + "strokeColor=#82b366;dashed=1;curved=1;"
 SUBNET_STYLE = (
     "ellipse;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;"
     "fontFamily=Helvetica;fontSize=10;align=center;"
 )
-OSPF_EDGE_STYLE = EDGE_STYLE + "strokeColor=#d79b00;strokeWidth=2;"
-BGP_EDGE_STYLE = EDGE_STYLE + "strokeColor=#9673a6;strokeWidth=2;"
+OSPF_EDGE_STYLE = EDGE_STYLE + "strokeColor=#d79b00;strokeWidth=2;curved=1;"
+BGP_EDGE_STYLE = EDGE_STYLE + "strokeColor=#9673a6;strokeWidth=2;curved=1;"
 EXTERNAL_STYLE = (
     "rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;"
     "fontFamily=Helvetica;fontSize=10;align=center;dashed=1;"
@@ -1086,148 +1086,252 @@ class _XmlBuilder:
         return nid
 
     def edge(self, layer: str, label: str, style: str,
-             src: str, dst: str) -> None:
+             src: str, dst: str,
+             src_label: str = "", dst_label: str = "",
+             waypoint: tuple[float, float] | None = None) -> None:
+        """Draw an edge; optional src/dst labels render at each end.
+
+        End labels are draw.io child cells parented to the edge with
+        relative geometry: x=-0.75 sits near the source node, x=+0.75
+        near the target — so each port number appears beside the switch
+        it belongs to, removing any which-end-is-which ambiguity.
+
+        A waypoint bows the edge through that coordinate, used to fan
+        out per-layer edges so overlaid layers stay readable.
+        """
         eid = f"e{self._next}"
         self._next += 1
+        wp = ""
+        if waypoint is not None:
+            wp = (f'<Array as="points"><mxPoint x="{waypoint[0]:.0f}" '
+                  f'y="{waypoint[1]:.0f}"/></Array>')
         self.cells.append(
             f'<mxCell id="{eid}" value="{self._esc(label)}" style="{style}" '
             f'edge="1" parent="{layer}" source="{src}" target="{dst}">'
-            f'<mxGeometry relative="1" as="geometry"/></mxCell>')
-
-
-def to_drawio_xml(topo: Topology,
-                  l2_edges: list[L2Edge] | None = None,
-                  l3_segments: list[L3Segment] | None = None,
-                  routing_adjs: list[RoutingAdj] | None = None,
-                  vsx_pairs: list[tuple[str, str]] | None = None) -> str:
-    """Emit a draw.io file with up to four toggleable layers.
-
-    All layers reuse the same node coordinates so switching layers keeps
-    each device in place. Toggle via View > Layers in draw.io.
-    """
-    pos = _layout(topo, vsx_pairs)
-    xb = _XmlBuilder()
-
-    def vsx_boxes(layer: str, node_keys: set) -> None:
-        """Dashed container behind each VSX pair (emit before nodes)."""
-        for a, b in (vsx_pairs or []):
-            if a not in node_keys or b not in node_keys:
+            f'<mxGeometry relative="1" as="geometry">{wp}</mxGeometry>'
+            f'</mxCell>')
+        for text, xpos in ((src_label, -0.75), (dst_label, 0.75)):
+            if not text:
                 continue
-            (ax, ay), (bx, by) = pos[a], pos[b]
-            x0, x1 = min(ax, bx) - NODE_W / 2, max(ax, bx) + NODE_W / 2
-            y0, y1 = min(ay, by) - NODE_H / 2, max(ay, by) + NODE_H / 2
-            xb.node(layer, "VSX", VSX_BOX_STYLE,
-                    (x0 + x1) / 2, (y0 + y1) / 2 - 12,
-                    w=(x1 - x0) + 30, h=(y1 - y0) + 54)
+            lid = f"el{self._next}"
+            self._next += 1
+            self.cells.append(
+                f'<mxCell id="{lid}" value="{self._esc(text)}" '
+                f'style="edgeLabel;html=1;align=center;verticalAlign=middle;'
+                f'resizable=0;points=[];fontSize=9;fontColor=#333333;'
+                f'labelBackgroundColor=#ffffff;" '
+                f'vertex="1" connectable="0" parent="{eid}">'
+                f'<mxGeometry x="{xpos}" relative="1" as="geometry">'
+                f'<mxPoint as="offset"/></mxGeometry></mxCell>')
 
-    # ---- Layer 1: physical (visible by default) --------------------------
-    xb.layer("lyr_phys", "1 - Physical (LLDP)", visible=True)
-    vsx_boxes("lyr_phys", set(topo.devices))
-    phys_ids: dict[str, str] = {}
+
+def _bow(pos: dict, key_a: str, key_b: str, offset: float
+         ) -> tuple[float, float] | None:
+    """Midpoint displaced perpendicular to the a->b line (layered mode)."""
+    if offset == 0 or key_a not in pos or key_b not in pos:
+        return None
+    (ax, ay), (bx, by) = pos[key_a], pos[key_b]
+    dx, dy = bx - ax, by - ay
+    norm = math.hypot(dx, dy)
+    if norm < 1:
+        return None
+    px, py = -dy / norm, dx / norm
+    return ((ax + bx) / 2 + px * offset, (ay + by) / 2 + py * offset)
+
+
+def _vsx_boxes(xb: "_XmlBuilder", parent: str, pos: dict,
+               vsx_pairs: list[tuple[str, str]] | None,
+               node_keys: set) -> None:
+    """Dashed container behind each VSX pair (emit before nodes)."""
+    for a, b in (vsx_pairs or []):
+        if a not in node_keys or b not in node_keys:
+            continue
+        if a not in pos or b not in pos:
+            continue
+        (ax, ay), (bx, by) = pos[a], pos[b]
+        x0, x1 = min(ax, bx) - NODE_W / 2, max(ax, bx) + NODE_W / 2
+        y0, y1 = min(ay, by) - NODE_H / 2, max(ay, by) + NODE_H / 2
+        xb.node(parent, "VSX", VSX_BOX_STYLE,
+                (x0 + x1) / 2, (y0 + y1) / 2 - 12,
+                w=(x1 - x0) + 30, h=(y1 - y0) + 54)
+
+
+def _render_physical(xb: "_XmlBuilder", parent: str, topo: Topology,
+                     pos: dict,
+                     vsx_pairs: list[tuple[str, str]] | None) -> None:
+    _vsx_boxes(xb, parent, pos, vsx_pairs, set(topo.devices))
+    ids: dict[str, str] = {}
     for key, dev in topo.devices.items():
         x, y = pos.get(key, (100, 100))
         style = SWITCH_STYLE if dev.is_switch else ENDPOINT_STYLE
-        phys_ids[key] = xb.node("lyr_phys", dev.label, style, x, y)
+        ids[key] = xb.node(parent, dev.label, style, x, y)
     for edge in topo.edges.values():
-        src, dst = phys_ids.get(edge.a_key), phys_ids.get(edge.b_key)
+        src, dst = ids.get(edge.a_key), ids.get(edge.b_key)
         if src and dst:
-            xb.edge("lyr_phys", f"{edge.a_port} \u2194 {edge.b_port}",
-                    EDGE_STYLE, src, dst)
+            xb.edge(parent, "", EDGE_STYLE, src, dst,
+                    src_label=edge.a_port, dst_label=edge.b_port)
 
-    # ---- Layer 2: L2 (LAGs + VLANs) ---------------------------------------
-    if l2_edges:
-        xb.layer("lyr_l2", "2 - Layer 2 (LAGs / VLANs)", visible=False)
-        l2_devs = {e.a_key for e in l2_edges} | {e.b_key for e in l2_edges}
-        vsx_boxes("lyr_l2", l2_devs)
-        l2_ids: dict[str, str] = {}
-        for key in l2_devs:
-            dev = topo.devices[key]
-            x, y = pos.get(key, (100, 100))
-            l2_ids[key] = xb.node("lyr_l2", dev.label, SWITCH_STYLE, x, y)
-        for e in l2_edges:
-            bits = [f"{e.a_if} \u2194 {e.b_if}"]
-            if e.member_count > 1:
-                bits.append(f"{e.member_count}x links")
-            if e.vlan_label:
-                bits.append(e.vlan_label)
-            xb.edge("lyr_l2", "\n".join(bits), L2_EDGE_STYLE,
-                    l2_ids[e.a_key], l2_ids[e.b_key])
 
-    # ---- Layer 3: L3 (VRFs / subnets) --------------------------------------
-    if l3_segments:
-        xb.layer("lyr_l3", "3 - Layer 3 (subnets / VRFs)", visible=False)
-        l3_ids: dict[str, str] = {}
-        l3_devs = {k for seg in l3_segments for k in seg.members}
-        for key in l3_devs:
-            dev = topo.devices.get(key)
-            if dev is None:
-                continue
-            x, y = pos.get(key, (100, 100))
-            l3_ids[key] = xb.node("lyr_l3", dev.label, SWITCH_STYLE, x, y)
-        for seg in l3_segments:
-            members = [k for k in seg.members if k in l3_ids]
-            if len(members) < 2:
-                continue
-            if len(members) == 2:
-                a, b = members
-                label = (f"{seg.label}\n{seg.members[a]}"
-                         f" \u2194 {seg.members[b]}")
-                xb.edge("lyr_l3", label, L3_EDGE_STYLE,
-                        l3_ids[a], l3_ids[b])
-            else:
-                # Shared segment: subnet hub node with spokes.
-                xs = [pos[k][0] for k in members]
-                ys = [pos[k][1] for k in members]
-                hub = xb.node("lyr_l3", seg.label, SUBNET_STYLE,
-                              sum(xs) / len(xs), sum(ys) / len(ys),
-                              w=160, h=50)
-                for k in members:
-                    xb.edge("lyr_l3", seg.members[k], L3_EDGE_STYLE,
-                            l3_ids[k], hub)
+def _render_l2(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
+               l2_edges: list[L2Edge],
+               vsx_pairs: list[tuple[str, str]] | None,
+               bow_offset: float = 0.0) -> None:
+    l2_devs = {e.a_key for e in l2_edges} | {e.b_key for e in l2_edges}
+    _vsx_boxes(xb, parent, pos, vsx_pairs, l2_devs)
+    ids: dict[str, str] = {}
+    for key in l2_devs:
+        dev = topo.devices[key]
+        x, y = pos.get(key, (100, 100))
+        ids[key] = xb.node(parent, dev.label, SWITCH_STYLE, x, y)
+    for e in l2_edges:
+        bits = []
+        if e.member_count > 1:
+            bits.append(f"{e.member_count}x links")
+        if e.vlan_label:
+            bits.append(e.vlan_label)
+        xb.edge(parent, "\n".join(bits), L2_EDGE_STYLE,
+                ids[e.a_key], ids[e.b_key],
+                src_label=e.a_if, dst_label=e.b_if,
+                waypoint=_bow(pos, e.a_key, e.b_key, bow_offset))
 
-    # ---- Layer 4: routing protocols (OSPF / BGP) ---------------------------
-    if routing_adjs:
-        xb.layer("lyr_rtg", "4 - Routing (OSPF / BGP)", visible=False)
-        rt_devs = {a.a_key for a in routing_adjs} | {
-            a.b_key for a in routing_adjs if a.b_key}
-        rt_ids: dict[str, str] = {}
-        for key in rt_devs:
-            dev = topo.devices.get(key)
-            if dev is None:
-                continue
-            x, y = pos.get(key, (100, 100))
-            rt_ids[key] = xb.node("lyr_rtg", dev.label, SWITCH_STYLE, x, y)
-        # External peers: one node per unmatched IP, placed centrally.
-        ext_ips = sorted({a.b_external for a in routing_adjs
-                          if a.b_external})
-        for j, ip in enumerate(ext_ips):
-            rt_ids[f"ext:{ip}"] = xb.node(
-                "lyr_rtg", f"{ip}\n(external peer)", EXTERNAL_STYLE,
-                200 + (j % 4) * (NODE_W + 60),
-                80 + (j // 4) * (NODE_H + 40))
-        for adj in routing_adjs:
-            src = rt_ids.get(adj.a_key)
-            dst = rt_ids.get(adj.b_key or f"ext:{adj.b_external}")
-            if not (src and dst):
-                continue
-            style = (OSPF_EDGE_STYLE if adj.protocol == "ospf"
-                     else BGP_EDGE_STYLE)
-            xb.edge("lyr_rtg", adj.label, style, src, dst)
 
-    body = "\n        ".join(xb.cells)
-    return f"""<mxfile host="lldp_mapper" type="device">
-  <diagram name="Topology" id="lldp-topology">
-    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1"
+def _render_l3(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
+               l3_segments: list[L3Segment],
+               bow_offset: float = 0.0) -> None:
+    ids: dict[str, str] = {}
+    l3_devs = {k for seg in l3_segments for k in seg.members}
+    for key in l3_devs:
+        dev = topo.devices.get(key)
+        if dev is None:
+            continue
+        x, y = pos.get(key, (100, 100))
+        ids[key] = xb.node(parent, dev.label, SWITCH_STYLE, x, y)
+    for seg in l3_segments:
+        members = [k for k in seg.members if k in ids]
+        if len(members) < 2:
+            continue
+        if len(members) == 2:
+            a, b = members
+            xb.edge(parent, seg.label, L3_EDGE_STYLE, ids[a], ids[b],
+                    src_label=seg.members[a], dst_label=seg.members[b],
+                    waypoint=_bow(pos, a, b, bow_offset))
+        else:
+            xs = [pos[k][0] for k in members]
+            ys = [pos[k][1] for k in members]
+            hub = xb.node(parent, seg.label, SUBNET_STYLE,
+                          sum(xs) / len(xs), sum(ys) / len(ys),
+                          w=160, h=50)
+            for k in members:
+                xb.edge(parent, seg.members[k], L3_EDGE_STYLE, ids[k], hub)
+
+
+def _render_routing(xb: "_XmlBuilder", parent: str, topo: Topology,
+                    pos: dict, routing_adjs: list[RoutingAdj],
+                    bow_offset: float = 0.0) -> None:
+    rt_devs = {a.a_key for a in routing_adjs} | {
+        a.b_key for a in routing_adjs if a.b_key}
+    ids: dict[str, str] = {}
+    for key in rt_devs:
+        dev = topo.devices.get(key)
+        if dev is None:
+            continue
+        x, y = pos.get(key, (100, 100))
+        ids[key] = xb.node(parent, dev.label, SWITCH_STYLE, x, y)
+    ext_ips = sorted({a.b_external for a in routing_adjs if a.b_external})
+    for j, ip in enumerate(ext_ips):
+        ids[f"ext:{ip}"] = xb.node(
+            parent, f"{ip}\n(external peer)", EXTERNAL_STYLE,
+            200 + (j % 4) * (NODE_W + 60),
+            80 + (j // 4) * (NODE_H + 40))
+    for adj in routing_adjs:
+        src = ids.get(adj.a_key)
+        dst = ids.get(adj.b_key or f"ext:{adj.b_external}")
+        if not (src and dst):
+            continue
+        style = (OSPF_EDGE_STYLE if adj.protocol == "ospf"
+                 else BGP_EDGE_STYLE)
+        wp = (_bow(pos, adj.a_key, adj.b_key, bow_offset)
+              if adj.b_key else None)
+        xb.edge(parent, adj.label, style, src, dst, waypoint=wp)
+
+
+_GRAPH_MODEL = """    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1"
                   tooltips="1" connect="1" arrows="1" fold="1" page="1"
                   pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
       <root>
         <mxCell id="0"/>
         {body}
       </root>
-    </mxGraphModel>
-  </diagram>
-</mxfile>
-"""
+    </mxGraphModel>"""
+
+
+def to_drawio_xml(topo: Topology,
+                  l2_edges: list[L2Edge] | None = None,
+                  l3_segments: list[L3Segment] | None = None,
+                  routing_adjs: list[RoutingAdj] | None = None,
+                  vsx_pairs: list[tuple[str, str]] | None = None,
+                  layered: bool = False) -> str:
+    """Emit a draw.io file with one view per PAGE (default) or as
+    toggleable layers on a single page (layered=True).
+
+    Pages keep each view on its own clean canvas — tabs along the
+    bottom in draw.io — with identical node positions, so flipping
+    tabs reads like toggling layers without any overlap. Layered mode
+    overlays all views on one page (with per-layer edge bowing) for
+    side-by-side comparison, at the cost of visual density.
+    """
+    pos = _layout(topo, vsx_pairs)
+
+    if layered:
+        xb = _XmlBuilder()
+        xb.layer("lyr_phys", "1 - Physical (LLDP)", visible=True)
+        _render_physical(xb, "lyr_phys", topo, pos, vsx_pairs)
+        if l2_edges:
+            xb.layer("lyr_l2", "2 - Layer 2 (LAGs / VLANs)", visible=False)
+            _render_l2(xb, "lyr_l2", topo, pos, l2_edges, vsx_pairs,
+                       bow_offset=30.0)
+        if l3_segments:
+            xb.layer("lyr_l3", "3 - Layer 3 (subnets / VRFs)",
+                     visible=False)
+            _render_l3(xb, "lyr_l3", topo, pos, l3_segments,
+                       bow_offset=-30.0)
+        if routing_adjs:
+            xb.layer("lyr_rtg", "4 - Routing (OSPF / BGP)", visible=False)
+            _render_routing(xb, "lyr_rtg", topo, pos, routing_adjs,
+                            bow_offset=60.0)
+        body = "\n        ".join(xb.cells)
+        pages = [("Topology", "lldp-topology", body)]
+    else:
+        pages = []
+
+        def page(name, page_id, render):
+            xb = _XmlBuilder()
+            xb.cells.append('<mxCell id="1" parent="0"/>')
+            render(xb)
+            pages.append((name, page_id,
+                          "\n        ".join(xb.cells)))
+
+        page("Physical", "page-phys",
+             lambda xb: _render_physical(xb, "1", topo, pos, vsx_pairs))
+        if l2_edges:
+            page("Layer 2", "page-l2",
+                 lambda xb: _render_l2(xb, "1", topo, pos, l2_edges,
+                                       vsx_pairs))
+        if l3_segments:
+            page("Layer 3", "page-l3",
+                 lambda xb: _render_l3(xb, "1", topo, pos, l3_segments))
+        if routing_adjs:
+            page("Routing", "page-rtg",
+                 lambda xb: _render_routing(xb, "1", topo, pos,
+                                            routing_adjs))
+
+    diagrams = "\n".join(
+        f'  <diagram name="{escape(name)}" id="{page_id}">\n'
+        + _GRAPH_MODEL.format(body=body)
+        + "\n  </diagram>"
+        for name, page_id, body in pages)
+    return (f'<mxfile host="lldp_mapper" type="device">\n'
+            f'{diagrams}\n</mxfile>\n')
 
 
 def to_diff_drawio(old: Topology, new: Topology, diff: TopoDiff) -> str:
@@ -1258,14 +1362,13 @@ def to_diff_drawio(old: Topology, new: Topology, diff: TopoDiff) -> str:
 
     for edges, style, prefix in (
             (diff.unchanged_links, EDGE_STYLE, ""),
-            (diff.added_links, DIFF_ADDED_EDGE, "+ "),
-            (diff.removed_links, DIFF_REMOVED_EDGE, "\u2212 ")):
+            (diff.added_links, DIFF_ADDED_EDGE, "added"),
+            (diff.removed_links, DIFF_REMOVED_EDGE, "removed")):
         for e in edges:
             src, dst = ids.get(e.a_key), ids.get(e.b_key)
             if src and dst:
-                xb.edge("lyr_diff",
-                        f"{prefix}{e.a_port} \u2194 {e.b_port}",
-                        style, src, dst)
+                xb.edge("lyr_diff", prefix, style, src, dst,
+                        src_label=e.a_port, dst_label=e.b_port)
 
     body = "\n        ".join(xb.cells)
     return f"""<mxfile host="lldp_mapper" type="device">
@@ -1320,6 +1423,9 @@ def main(argv: list[str] | None = None) -> int:
                       help="'auto' negotiates the latest version via GET "
                            "/rest (v10.16 on 10.16 firmware); or pin one, "
                            "e.g. v10.04 (default: auto)")
+    scan.add_argument("--layered", action="store_true",
+                      help="single page with toggleable layers instead of "
+                           "one page per view")
     scan.add_argument("--include-endpoints", action="store_true",
                       help="include non-switch LLDP neighbours (APs, servers, phones)")
     scan.add_argument("--physical-only", action="store_true",
@@ -1417,9 +1523,11 @@ def run_scan(args) -> int:
 
     with open(args.output, "w") as f:
         f.write(to_drawio_xml(topo, l2_edges, l3_segments,
-                              routing_adjs, vsx_pairs))
-    log.info("draw.io diagram written to %s (layers: View > Layers)",
-             args.output)
+                              routing_adjs, vsx_pairs,
+                              layered=args.layered))
+    log.info("draw.io diagram written to %s (%s)", args.output,
+         "layers: View > Layers" if args.layered
+         else "one page per view — tabs at the bottom")
 
     if args.json:
         with open(args.json, "w") as f:
