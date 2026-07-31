@@ -112,6 +112,16 @@ failed login on that switch, which counts against any account-lockout
 policy your AAA enforces. The scan log shows which username succeeded
 per switch.
 
+## IPAM page
+
+Whenever interface details are collected and at least one switch has an
+L3 interface, the file gains an **IPAM** tab: one table per switch
+(Interface / VLAN / IP / VRF) covering every SVI, routed port, and
+loopback, SVIs first sorted by VLAN. It's a searchable addressing
+inventory generated for free from data the scan already has — open the
+tab and Ctrl+F an IP to find which switch and interface owns it. In
+area-split mode it appears as the final tab.
+
 ## Diff mode
 
 Every scan writes a JSON inventory alongside the diagram by default —
@@ -191,7 +201,19 @@ clustered into distribution blocks under their own parent pair, with
 gaps between blocks and parents aligned directly above their children.
 Port labels and pages survive manual re-arrangement in draw.io.
 
-**Large estates.** Above 15 switches, per-end interface labels move to
+**Area-split pages (large estates).** On estates of 16+ switches with
+two or more distribution blocks, the output automatically splits into
+per-area pages instead of one huge canvas: an **Overview** (cores plus
+one summary node per block with aggregated uplink counts), a
+**Physical** page per block (the agg pair, its access switches, and
+the cores for uplink context — small enough that printed interface
+labels return), **L2** pages for core/agg and per block, and **Routed**
+pages combining L3 subnets and routing adjacencies per area: Core,
+Core/Agg interconnect, and one per block. This suits point-to-point
+OSPF designs where every /31 and adjacency drawn globally becomes
+unreadable. Control with `--split always|never|auto`.
+
+**Large estates (flat mode).** Above 15 switches, per-end interface labels move to
 hover tooltips automatically (hover any link to see its ports); force
 printed labels with `--detail-labels`. On the Routing page, OSPF areas
 and iBGP meshes spanning three or more switches collapse into a

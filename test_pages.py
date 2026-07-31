@@ -141,3 +141,36 @@ kids = [c for c in l3cells if c.get("connectable") == "0"]
 assert any("vlan 20" in (c.get("value") or "") for c in kids)
 assert any("1/1/48" in (c.get("value") or "") for c in kids)
 print("single-stack L3 OK (leaf subnets, VRF, loopback excluded, L3 page)")
+
+# --- IPAM page: per-switch HTML tables of all L3 interfaces ------------------
+from lldp_mapper import _ipam_rows
+# stack_det has vlan20, vlan30 (CORP), 1/1/48 /31, loopback0
+rows = _ipam_rows(stack_det)
+assert ("vlan20", "20", "10.20.0.1/24", "default") in rows
+assert ("vlan30", "30", "10.30.0.1/24", "CORP") in rows
+assert ("1/1/48", "", "192.168.255.0/31", "default") in rows
+assert ("loopback0", "", "192.168.0.9/32", "default") in rows
+# SVIs sorted by VLAN before routed/loopback interfaces
+assert rows[0][0] == "vlan20" and rows[1][0] == "vlan30"
+print("IPAM rows OK (SVIs, routed port, loopback, VRF, sorted)")
+
+ipam_xml = to_drawio_xml(stopo, l2e, segs,
+                         port_details={stack.key: stack_det})
+iroot = ET.fromstring(ipam_xml)                 # valid XML despite HTML
+inames = [d.get("name") for d in iroot.findall("diagram")]
+assert inames[-1] == "IPAM", inames
+ipage = iroot.findall("diagram")[-1]
+tables = [c for c in ipage.findall(".//mxCell")
+          if "<table" in (c.get("value") or "")]
+assert len(tables) == 1
+val = tables[0].get("value")
+assert "stack-01" in val and "10.30.0.1/24" in val and "CORP" in val
+assert "<th" in val and "Interface" in val
+print("IPAM page OK (HTML table renders per switch, XML stays valid)")
+
+# no L3 data -> no IPAM tab
+no_l3 = to_drawio_xml(stopo, l2e, port_details={stack.key: {
+    "1/1/10": stack_det["1/1/10"]}})
+assert "IPAM" not in [d.get("name")
+                      for d in ET.fromstring(no_l3).findall("diagram")]
+print("IPAM omitted when no L3 interfaces exist")

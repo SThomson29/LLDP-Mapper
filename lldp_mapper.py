@@ -1042,6 +1042,81 @@ def _graph_centre(adj: dict[str, set[str]], nodes: list[str]) -> list[str]:
     return sorted(nodes)  # unreachable, defensive
 
 
+@dataclass
+class ScopeInfo:
+    tier: dict[str, int] = field(default_factory=dict)      # key -> depth
+    block: dict[str, int] = field(default_factory=dict)     # key -> block id
+    block_label: dict[int, str] = field(default_factory=dict)
+    core_keys: set = field(default_factory=set)
+
+    def splittable(self) -> bool:
+        return (len(self.block_label) >= 2
+                and max(self.tier.values(), default=0) >= 2)
+
+
+def _block_name(hostnames: list[str]) -> str:
+    common = os.path.commonprefix(hostnames).rstrip("-_")
+    return common if len(common) >= 3 else "/".join(hostnames)
+
+
+def classify_scopes(topo: Topology,
+                    vsx_pairs: list[tuple[str, str]] | None = None,
+                    core_hints: list[str] | None = None) -> ScopeInfo:
+    """Tier every switch (core=0) and assign tier-2+ switches to the
+    distribution block of their dominant tier-1 parent unit."""
+    info = ScopeInfo()
+    adj = _switch_adjacency(topo)
+    if not adj:
+        return info
+    pair_of: dict[str, str] = {}
+    for a, b in (vsx_pairs or []):
+        pair_of[a] = b
+        pair_of[b] = a
+    hints = set()
+    for h in (core_hints or []):
+        hl = h.lower()
+        for dev in topo.devices.values():
+            if dev.is_switch and hl in ((dev.hostname or "").lower(),
+                                        dev.mgmt_ip, dev.key):
+                hints.add(dev.key)
+    nodes = sorted(adj)
+    roots = sorted(hints & set(nodes)) or _graph_centre(adj, nodes)
+    roots = sorted(set(roots) | {pair_of[r] for r in roots
+                                 if pair_of.get(r) in adj})
+    info.core_keys = set(roots)
+    info.tier = _bfs_depths(adj, roots)
+    for n in nodes:
+        info.tier.setdefault(n, 99)
+
+    # Block units = VSX-paired (or single) tier-1 switches.
+    t1 = sorted((n for n in nodes if info.tier[n] == 1),
+                key=lambda k: topo.devices[k].hostname or k)
+    used: set = set()
+    for n in t1:
+        if n in used:
+            continue
+        p = pair_of.get(n)
+        unit = sorted([n, p]) if (p in t1 and p not in used) else [n]
+        used.update(unit)
+        bid = len(info.block_label)
+        info.block_label[bid] = _block_name(
+            [topo.devices[k].hostname or k for k in unit])
+        for k in unit:
+            info.block[k] = bid
+
+    # Deeper tiers inherit the block of their dominant known parent.
+    for t in range(2, max(info.tier.values()) + 1):
+        for n in (m for m in nodes if info.tier[m] == t):
+            votes: dict[int, int] = {}
+            for m in adj[n]:
+                if info.tier.get(m) == t - 1 and m in info.block:
+                    b = info.block[m]
+                    votes[b] = votes.get(b, 0) + 1
+            if votes:
+                info.block[n] = min(votes, key=lambda k: (-votes[k], k))
+    return info
+
+
 TIER_H = 280.0        # vertical distance between tiers
 UNIT_W = NODE_W + 90  # horizontal slot per switch
 
@@ -1387,7 +1462,9 @@ class _XmlBuilder:
     def _esc(label: str) -> str:
         # &#10; survives XML attribute-value normalisation; a literal
         # newline would be collapsed to a space by conformant parsers.
-        return escape(label, {"\n": "&#10;"})
+        # Double quotes are escaped so HTML-table labels can't break
+        # out of the value attribute.
+        return escape(label, {"\n": "&#10;", '"': "&quot;"})
 
     def layer(self, layer_id: str, name: str, visible: bool) -> None:
         vis = "" if visible else ' visible="0"'
@@ -1651,6 +1728,261 @@ def _render_routing(xb: "_XmlBuilder", parent: str, topo: Topology,
         xb.edge(parent, adj.label, style, src, dst, waypoint=wp)
 
 
+BLOCK_NODE_STYLE = (
+    "rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;"
+    "fontFamily=Helvetica;fontSize=11;align=center;strokeWidth=2;"
+)
+SPLIT_MIN_SWITCHES = 16
+
+
+def _sub_topology(topo: Topology, keys: set) -> Topology:
+    sub = Topology()
+    for k in keys:
+        dev = topo.devices.get(k)
+        if dev:
+            sub.upsert_device(Device(**{f: getattr(dev, f)
+                                        for f in Device.__dataclass_fields__}))
+    for e in topo.edges.values():
+        if e.a_key in keys and e.b_key in keys:
+            sub.add_edge(Edge(**vars(e)))
+    return sub
+
+
+def _scope_of_pair(info: "ScopeInfo", a: str, b: str) -> tuple:
+    """Classify an (a, b) relation: ('core',), ('coreagg',) or
+    ('block', bid). Endpoints (non-switch) inherit their peer."""
+    ta, tb = info.tier.get(a), info.tier.get(b)
+    if ta is None and tb is None:
+        return ("coreagg",)
+    if ta is None:
+        a, ta = b, tb
+    if tb is None:
+        tb = ta
+        b = a
+    if ta == 0 and tb == 0:
+        return ("core",)
+    if 0 in (ta, tb):
+        return ("coreagg",)
+    ba, bb = info.block.get(a), info.block.get(b)
+    if ba is not None and ba == bb:
+        return ("block", ba)
+    return ("coreagg",)
+
+
+IPAM_NODE_STYLE = (
+    "html=1;whiteSpace=wrap;align=left;verticalAlign=top;"
+    "fillColor=#ffffff;strokeColor=#666666;fontFamily=Helvetica;"
+    "fontSize=10;overflow=fill;"
+)
+IPAM_COLS = 3
+IPAM_W = 340.0
+IPAM_ROW_H = 19.0
+
+
+def _ipam_rows(details: dict[str, "PortInfo"]) -> list[tuple]:
+    rows = []
+    for p in details.values():
+        for addr in p.ip4:
+            vlan = str(p.svi_vlan) if p.svi_vlan is not None else ""
+            rows.append((p.svi_vlan if p.svi_vlan is not None else 10**6,
+                         p.name, vlan, addr, p.vrf))
+    rows.sort()
+    return [r[1:] for r in rows]
+
+
+def _render_ipam(xb: "_XmlBuilder", parent: str, topo: Topology,
+                 port_details: dict[str, dict[str, "PortInfo"]]) -> None:
+    """One HTML table per switch: Interface / VLAN / IP / VRF."""
+    col_heights = [90.0] * IPAM_COLS
+    devices = sorted(
+        (k for k in port_details if k in topo.devices),
+        key=lambda k: topo.devices[k].hostname or k)
+    for key in devices:
+        rows = _ipam_rows(port_details[key])
+        if not rows:
+            continue
+        dev = topo.devices[key]
+        body = "".join(
+            "<tr>" + "".join(
+                f"<td style='padding:2px 6px;border:1px solid #ccc;'>"
+                f"{cell}</td>" for cell in row) + "</tr>"
+            for row in rows)
+        html = (
+            f"<b>{dev.hostname or key}</b>"
+            f"<span style='color:#666;'> {dev.mgmt_ip}</span>"
+            f"<table style='border-collapse:collapse;margin-top:4px;"
+            f"width:100%;'>"
+            f"<tr><th style='padding:2px 6px;border:1px solid #999;"
+            f"background:#eee;'>Interface</th>"
+            f"<th style='padding:2px 6px;border:1px solid #999;"
+            f"background:#eee;'>VLAN</th>"
+            f"<th style='padding:2px 6px;border:1px solid #999;"
+            f"background:#eee;'>IP</th>"
+            f"<th style='padding:2px 6px;border:1px solid #999;"
+            f"background:#eee;'>VRF</th></tr>{body}</table>")
+        h = 44.0 + IPAM_ROW_H * (len(rows) + 1)
+        col = min(range(IPAM_COLS), key=lambda c: col_heights[c])
+        x = 60.0 + col * (IPAM_W + 40) + IPAM_W / 2
+        y = col_heights[col] + h / 2
+        xb.node(parent, html, IPAM_NODE_STYLE, x, y, w=IPAM_W, h=h)
+        col_heights[col] += h + 30.0
+
+
+def build_split_pages(topo: Topology, info: "ScopeInfo",
+                      l2_edges, l3_segments, routing_adjs, vsx_pairs,
+                      detail_small: bool = True):
+    """Return [(name, page_id, render_fn), ...] for area-split output."""
+    pages = []
+    l2_edges = l2_edges or []
+    l3_segments = l3_segments or []
+    routing_adjs = routing_adjs or []
+    blocks = sorted(info.block_label)
+    members: dict[int, set] = {b: set() for b in blocks}
+    for k, b in info.block.items():
+        members[b].add(k)
+    # endpoints ride with their attached switch's block
+    ep_block: dict[str, int] = {}
+    for e in topo.edges.values():
+        for k, other in ((e.a_key, e.b_key), (e.b_key, e.a_key)):
+            if k not in info.tier and other in info.block:
+                ep_block[k] = info.block[other]
+    core = set(info.core_keys)
+
+    # ---- Overview: cores + one node per block, aggregated uplinks ------
+    def render_overview(xb):
+        sub = _sub_topology(topo, core)
+        pos = _layout(sub, vsx_pairs)
+        ids = {}
+        _vsx_boxes(xb, "1", pos, vsx_pairs, core)
+        for k in core:
+            x, y = pos[k]
+            ids[k] = xb.node("1", topo.devices[k].label, SWITCH_STYLE, x, y)
+        for e in sub.edges.values():
+            xb.edge("1", "", EDGE_STYLE, ids[e.a_key], ids[e.b_key],
+                    src_label=e.a_port, dst_label=e.b_port)
+        cy = max((p[1] for p in pos.values()), default=150) + TIER_H
+        xs = sorted(pos.values())
+        cx0 = min((p[0] for p in pos.values()), default=200) - UNIT_W
+        counts: dict[tuple, int] = {}
+        for e in topo.edges.values():
+            for a, b in ((e.a_key, e.b_key), (e.b_key, e.a_key)):
+                if a in core and info.block.get(b) is not None:
+                    counts[(a, info.block[b])] = counts.get(
+                        (a, info.block[b]), 0) + 1
+        for j, bid in enumerate(blocks):
+            n_edge = sum(1 for k in members[bid]
+                         if info.tier.get(k, 0) >= 2)
+            n_agg = sum(1 for k in members[bid]
+                        if info.tier.get(k) == 1)
+            label = (f"{info.block_label[bid]}"
+                     f"\n{n_agg} agg / {n_edge} access")
+            bx = cx0 + (j + 1) * (UNIT_W * 1.6)
+            nid = xb.node("1", label, BLOCK_NODE_STYLE, bx, cy,
+                          w=NODE_W + 20, h=NODE_H)
+            for k in sorted(core):
+                c = counts.get((k, bid), 0)
+                if c:
+                    xb.edge("1", f"{c} links", EDGE_STYLE, ids[k], nid)
+
+    pages.append(("Overview", "page-overview", render_overview))
+
+    # ---- Per-block physical (with ghost cores for uplink context) ------
+    for bid in blocks:
+        keys = members[bid] | core | {k for k, b in ep_block.items()
+                                      if b == bid}
+        sub = _sub_topology(topo, keys)
+
+        def render_phys(xb, sub=sub):
+            pos = _layout(sub, vsx_pairs)
+            _render_physical(xb, "1", sub, pos, vsx_pairs,
+                             detail=detail_small)
+        pages.append((f"{info.block_label[bid]} - Physical",
+                      f"page-phys-b{bid}", render_phys))
+
+    # ---- L2 pages -------------------------------------------------------
+    def l2_scope(e):
+        return _scope_of_pair(info, e.a_key, e.b_key)
+
+    l2_core = [e for e in l2_edges if l2_scope(e)[0] in ("core", "coreagg")]
+    if l2_core:
+        def render_l2core(xb, edges=l2_core):
+            keys = {e.a_key for e in edges} | {e.b_key for e in edges}
+            sub = _sub_topology(topo, keys)
+            pos = _layout(sub, vsx_pairs)
+            _render_l2(xb, "1", sub, pos, edges, vsx_pairs,
+                       detail=detail_small)
+        pages.append(("Core/Agg - L2", "page-l2-core", render_l2core))
+    for bid in blocks:
+        edges = [e for e in l2_edges if l2_scope(e) == ("block", bid)]
+        if not edges:
+            continue
+
+        def render_l2b(xb, edges=edges):
+            keys = {e.a_key for e in edges} | {e.b_key for e in edges}
+            sub = _sub_topology(topo, keys)
+            pos = _layout(sub, vsx_pairs)
+            _render_l2(xb, "1", sub, pos, edges, vsx_pairs,
+                       detail=detail_small)
+        pages.append((f"{info.block_label[bid]} - L2",
+                      f"page-l2-b{bid}", render_l2b))
+
+    # ---- Routed pages: L3 segments + routing adjacencies together ------
+    def seg_scope(seg):
+        mk = list(seg.members)
+        if len(mk) == 1:
+            k = mk[0]
+            if k in core:
+                return ("core",)
+            b = info.block.get(k)
+            return ("block", b) if b is not None else ("coreagg",)
+        scopes = {_scope_of_pair(info, a, b)
+                  for a in mk for b in mk if a < b}
+        return scopes.pop() if len(scopes) == 1 else ("coreagg",)
+
+    def adj_scope(a):
+        if a.b_external:
+            k = a.a_key
+            if k in core:
+                return ("core",)
+            b = info.block.get(k)
+            return ("block", b) if b is not None else ("coreagg",)
+        return _scope_of_pair(info, a.a_key, a.b_key)
+
+    def routed_page(name, pid, segs, adjs):
+        if not segs and not adjs:
+            return
+        def render(xb, segs=segs, adjs=adjs):
+            keys = set()
+            for s in segs:
+                keys |= set(s.members)
+            for a in adjs:
+                keys.add(a.a_key)
+                if a.b_key:
+                    keys.add(a.b_key)
+            sub = _sub_topology(topo, keys)
+            pos = _layout(sub, vsx_pairs)
+            if segs:
+                _render_l3(xb, "1", sub, pos, segs, detail=detail_small)
+            if adjs:
+                _render_routing(xb, "1", sub, pos, adjs, bow_offset=45.0)
+        pages.append((name, pid, render))
+
+    routed_page("Core - Routed", "page-rt-core",
+                [s for s in l3_segments if seg_scope(s) == ("core",)],
+                [a for a in routing_adjs if adj_scope(a) == ("core",)])
+    routed_page("Core/Agg - Routed", "page-rt-coreagg",
+                [s for s in l3_segments if seg_scope(s) == ("coreagg",)],
+                [a for a in routing_adjs if adj_scope(a) == ("coreagg",)])
+    for bid in blocks:
+        routed_page(f"{info.block_label[bid]} - Routed",
+                    f"page-rt-b{bid}",
+                    [s for s in l3_segments
+                     if seg_scope(s) == ("block", bid)],
+                    [a for a in routing_adjs
+                     if adj_scope(a) == ("block", bid)])
+    return pages
+
+
 _GRAPH_MODEL = """    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1"
                   tooltips="1" connect="1" arrows="1" fold="1" page="1"
                   pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
@@ -1669,7 +2001,10 @@ def to_drawio_xml(topo: Topology,
                   layered: bool = False,
                   layout: str = "tiered",
                   core_hints: list[str] | None = None,
-                  force_detail: bool = False) -> str:
+                  force_detail: bool = False,
+                  split: str = "auto",
+                  port_details: dict[str, dict[str, PortInfo]] | None = None
+                  ) -> str:
     """Emit a draw.io file with one view per PAGE (default) or as
     toggleable layers on a single page (layered=True).
 
@@ -1707,6 +2042,11 @@ def to_drawio_xml(topo: Topology,
         body = "\n        ".join(xb.cells)
         pages = [("Topology", "lldp-topology", body)]
     else:
+        info = classify_scopes(topo, vsx_pairs, core_hints)
+        do_split = (split == "always"
+                    or (split == "auto"
+                        and n_switches >= SPLIT_MIN_SWITCHES
+                        and info.splittable()))
         pages = []
 
         def page(name, page_id, render):
@@ -1715,6 +2055,27 @@ def to_drawio_xml(topo: Topology,
             render(xb)
             pages.append((name, page_id,
                           "\n        ".join(xb.cells)))
+
+        if do_split:
+            log.info("area split: %d blocks (%s) — per-area pages "
+                     "(disable with --split never)",
+                     len(info.block_label),
+                     ", ".join(info.block_label.values()))
+            for name, pid, render in build_split_pages(
+                    topo, info, l2_edges, l3_segments, routing_adjs,
+                    vsx_pairs, detail_small=True):
+                page(name, pid, render)
+            if port_details and any(_ipam_rows(d)
+                                    for d in port_details.values()):
+                page("IPAM", "page-ipam",
+                     lambda xb: _render_ipam(xb, "1", topo, port_details))
+            diagrams = "\n".join(
+                f'  <diagram name="{escape(name)}" id="{page_id}">\n'
+                + _GRAPH_MODEL.format(body=body)
+                + "\n  </diagram>"
+                for name, page_id, body in pages)
+            return (f'<mxfile host="lldp_mapper" type="device">\n'
+                    f'{diagrams}\n</mxfile>\n')
 
         page("Physical", "page-phys",
              lambda xb: _render_physical(xb, "1", topo, pos, vsx_pairs,
@@ -1731,6 +2092,10 @@ def to_drawio_xml(topo: Topology,
             page("Routing", "page-rtg",
                  lambda xb: _render_routing(xb, "1", topo, pos,
                                             routing_adjs))
+        if port_details and any(_ipam_rows(d)
+                                for d in port_details.values()):
+            page("IPAM", "page-ipam",
+                 lambda xb: _render_ipam(xb, "1", topo, port_details))
 
     diagrams = "\n".join(
         f'  <diagram name="{escape(name)}" id="{page_id}">\n'
@@ -1846,6 +2211,12 @@ def main(argv: list[str] | None = None) -> int:
                       help="include subnets attached to only one switch "
                            "(SVIs, uplink /30s) as leaf nodes on the L3 "
                            "page — needed for single-switch/stack estates")
+    scan.add_argument("--split", choices=["auto", "always", "never"],
+                      default="auto",
+                      help="area-split pages (Overview + per-block Physical"
+                           "/L2/Routed): auto engages on estates of %d+ "
+                           "switches with 2+ distribution blocks"
+                           % 16)
     scan.add_argument("--detail-labels", action="store_true",
                       help="always print interface labels at edge ends; "
                            "by default estates over %d switches move them "
@@ -1996,6 +2367,7 @@ def run_scan(args) -> int:
 
     topo = build_topology(polled, include_endpoints=args.include_endpoints)
 
+    details_by_dev = None
     l2_edges, l3_segments, routing_adjs, vsx_pairs = None, None, None, None
     if want_details:
         details_by_dev = {pr.device.key: pr.details for pr in polled}
@@ -2021,7 +2393,9 @@ def run_scan(args) -> int:
                               routing_adjs, vsx_pairs,
                               layered=args.layered,
                               layout=args.layout, core_hints=args.core,
-                              force_detail=args.detail_labels))
+                              force_detail=args.detail_labels,
+                              split=args.split,
+                              port_details=details_by_dev))
     log.info("draw.io diagram written to %s (%s)", args.output,
          "layers: View > Layers" if args.layered
          else "one page per view — tabs at the bottom")

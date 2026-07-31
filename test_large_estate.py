@@ -67,7 +67,8 @@ for acc in [n for n in K if n.startswith("acc-")]:
                            a_key=K[acc], b_key=K["core-01"],
                            detail="area 0.0.0.0", state="FULL"))
 
-xml = to_drawio_xml(topo, routing_adjs=adjs, vsx_pairs=pairs)
+xml = to_drawio_xml(topo, routing_adjs=adjs, vsx_pairs=pairs,
+                    split="never")
 root = ET.fromstring(xml)
 
 # tooltip mode: 20 switches > 15 -> physical edges carry tooltips,
@@ -97,8 +98,65 @@ print(f"routing hubs OK (2 hubs, {len(edges)} spokes vs "
       f"{28 + 13} pairwise edges)")
 
 # --detail-labels forces printed labels back on
-xml2 = to_drawio_xml(topo, vsx_pairs=pairs, force_detail=True)
+xml2 = to_drawio_xml(topo, vsx_pairs=pairs, force_detail=True,
+                     split="never")
 phys2 = ET.fromstring(xml2).findall("diagram")[0]
 assert [c for c in phys2.findall(".//mxCell")
         if c.get("connectable") == "0"]
 print("--detail-labels override OK")
+
+# --- area split (the default for this estate size) ---------------------------
+from lldp_mapper import L3Segment, classify_scopes
+
+info = classify_scopes(topo, pairs)
+assert info.splittable() and len(info.block_label) == 3
+assert set(info.block_label.values()) == {"agg-1", "agg-2", "agg-3"}
+assert info.tier[K["core-01"]] == 0 and info.tier[K["acc-31"]] == 2
+assert info.block[K["acc-31"]] == info.block[K["agg-3a"]]
+print("scope classification OK (3 blocks, common-prefix names)")
+
+# p2p L3: a /31 inside block 1 and a /31 from agg to core
+segs = [
+    L3Segment(vrf="default", network="10.255.1.0/31",
+              members={K["agg-1a"]: "1/1/20 · 10.255.1.0",
+                       K["acc-11"]: "1/1/48 · 10.255.1.1"}),
+    L3Segment(vrf="default", network="10.254.0.0/31",
+              members={K["core-01"]: "1/1/30 · 10.254.0.0",
+                       K["agg-2a"]: "1/1/47 · 10.254.0.1"}),
+]
+sxml = to_drawio_xml(topo, l3_segments=segs, routing_adjs=adjs,
+                     vsx_pairs=pairs)   # auto -> split
+sroot = ET.fromstring(sxml)
+names = [d.get("name") for d in sroot.findall("diagram")]
+assert names[0] == "Overview"
+for want in ("agg-1 - Physical", "agg-2 - Physical", "agg-3 - Physical",
+             "Core - Routed", "Core/Agg - Routed", "agg-1 - Routed"):
+    assert want in names, (want, names)
+assert "Physical" not in names          # flat pages replaced
+print(f"area split OK ({len(names)} tabs: {', '.join(names[:4])}, ...)")
+
+# Overview: 2 cores + 3 block nodes, aggregated '2 links' uplink edges
+ov = sroot.findall("diagram")[0]
+ovc = ov.findall(".//mxCell")
+blocknodes = [c for c in ovc if "agg / " in (c.get("value") or "")]
+assert len(blocknodes) == 3
+assert any("2 agg / 4 access" in (c.get("value") or "") for c in blocknodes)
+agg_edges = [c for c in ovc if (c.get("value") or "").endswith("links")]
+assert len(agg_edges) == 6              # 2 cores x 3 blocks
+assert all(c.get("value") == "2 links" for c in agg_edges)
+print("overview OK (cores + 3 block nodes, aggregated uplinks)")
+
+# Block Routed page: the intra-block /31 and the pair's iBGP, small
+# enough for printed detail; the core<->agg /31 lands on Core/Agg page
+def page_named(n):
+    return next(d for d in sroot.findall("diagram") if d.get("name") == n)
+b1 = page_named("agg-1 - Routed")
+vals = " ".join(c.get("value") or "" for c in b1.findall(".//mxCell"))
+assert "10.255.1.0/31" in vals and "10.254.0.0/31" not in vals
+ca = page_named("Core/Agg - Routed")
+cav = " ".join(c.get("value") or "" for c in ca.findall(".//mxCell"))
+assert "10.254.0.0/31" in cav
+core_rt = page_named("Core - Routed")
+crv = " ".join(c.get("value") or "" for c in core_rt.findall(".//mxCell"))
+assert "iBGP AS 65001" in crv
+print("routed scoping OK (p2p /31s land on the right area pages)")
