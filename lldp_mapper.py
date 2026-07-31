@@ -1021,16 +1021,25 @@ def _bfs_depths(adj: dict[str, set[str]], roots: list[str]) -> dict[str, int]:
 
 
 def _graph_centre(adj: dict[str, set[str]], nodes: list[str]) -> list[str]:
-    """Nodes with minimum eccentricity — the core of a hierarchy."""
-    best_ecc, centre = None, []
-    for n in nodes:
-        depths = _bfs_depths(adj, [n])
-        ecc = max((d for m, d in depths.items() if m in nodes), default=0)
-        if best_ecc is None or ecc < best_ecc:
-            best_ecc, centre = ecc, [n]
-        elif ecc == best_ecc:
-            centre.append(n)
-    return centre
+    """Core detection by iterative minimum-degree peeling.
+
+    Repeatedly strip the current minimum-degree switches; the last
+    surviving set is the core. Robust where eccentricity is not:
+    dual-homed campus designs collapse the graph diameter to ~2, making
+    every node a 'centre' by eccentricity, while peeling still removes
+    access first (fewest uplinks), then aggregation, leaving the core.
+    Degenerate topologies (rings, full meshes) tie on the final round
+    and return that whole set — an honest single tier.
+    """
+    remaining = set(nodes)
+    while remaining:
+        deg = {n: len(adj.get(n, set()) & remaining) for n in remaining}
+        m = min(deg.values())
+        peel = {n for n, d in deg.items() if d == m}
+        if peel == remaining:
+            return sorted(remaining)
+        remaining -= peel
+    return sorted(nodes)  # unreachable, defensive
 
 
 TIER_H = 280.0        # vertical distance between tiers
@@ -1076,9 +1085,12 @@ def _layout_tiered(topo: Topology,
         comp_nodes = sorted(comp)
 
         roots = sorted(hints & comp) or _graph_centre(adj, comp_nodes)
-        # A VSX partner of any root is core too, whatever BFS says.
+        # A VSX partner of any root is core too, whatever detection says.
         roots = sorted(set(roots) | {pair_of[r] for r in roots
                                      if pair_of.get(r) in comp})
+        log.info("tiered layout: core tier = %s%s",
+                 ", ".join(topo.devices[r].hostname or r for r in roots),
+                 "" if hints else " (auto-detected; override with --core)")
         depths = _bfs_depths(adj, roots)
         # Unreached members (shouldn't happen within a component) -> deepest
         maxd = max((depths.get(n, 0) for n in comp_nodes), default=0)

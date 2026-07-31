@@ -61,3 +61,47 @@ print("--core hint OK (pinned switch takes the top tier)")
 posc = _layout(topo, pairs, "circle")
 assert len(posc) == len(pos)
 print("circle fallback OK")
+
+# --- REGRESSION: dual-homed 3-tier (the real-world shape that broke) ---------
+topo2 = Topology()
+K2 = {}
+for i, name in enumerate(["core-01", "core-02", "agg-01", "agg-02",
+                          "acc-01", "acc-02", "acc-03", "acc-04"]):
+    K2[name] = f"bb:00:00:00:00:0{i}"
+    topo2.upsert_device(sw(K2[name], name))
+
+def link2(a, b):
+    topo2.add_edge(Edge(a_key=K2[a], a_port="x", b_key=K2[b], b_port="y"))
+
+link2("core-01", "core-02")
+for agg in ("agg-01", "agg-02"):
+    link2("core-01", agg); link2("core-02", agg)
+for acc in ("acc-01", "acc-02", "acc-03", "acc-04"):
+    link2("agg-01", acc); link2("agg-02", acc)   # dual-homed access
+
+pos2t = _layout(topo2, [(K2["core-01"], K2["core-02"])])
+y2 = {n: pos2t[K2[n]][1] for n in K2}
+rows = sorted({round(v) for v in y2.values()})
+assert len(rows) == 3, (rows, y2)
+assert y2["core-01"] == y2["core-02"] < y2["agg-01"] == y2["agg-02"] \
+    < y2["acc-01"] == y2["acc-04"], y2
+print("dual-homed 3-tier OK (3 rows despite diameter-2 graph)")
+
+# collapsed core (2-tier, dual-homed access straight to core pair)
+topo3 = Topology()
+K3 = {}
+for i, name in enumerate(["core-01", "core-02", "acc-01", "acc-02",
+                          "acc-03"]):
+    K3[name] = f"cc:00:00:00:00:0{i}"
+    topo3.upsert_device(sw(K3[name], name))
+
+def link3(a, b):
+    topo3.add_edge(Edge(a_key=K3[a], a_port="x", b_key=K3[b], b_port="y"))
+
+link3("core-01", "core-02")
+for acc in ("acc-01", "acc-02", "acc-03"):
+    link3("core-01", acc); link3("core-02", acc)
+pos3 = _layout(topo3, [(K3["core-01"], K3["core-02"])])
+assert pos3[K3["core-01"]][1] < pos3[K3["acc-01"]][1]
+assert len({round(pos3[K3[n]][1]) for n in K3}) == 2
+print("collapsed-core 2-tier OK")

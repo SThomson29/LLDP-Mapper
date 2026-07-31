@@ -177,9 +177,10 @@ and be mindful of what a failed login means on devices with lockout
 policies.
 
 **Layout.** The default tiered layout infers the hierarchy from the
-topology itself: the graph centre (minimum eccentricity, which in a
-hierarchical network is the core — VSX pairs included) forms the top
-row, and every further tier is one hop down, so a 3-tier campus renders
+topology itself: the core is found by iterative
+minimum-degree peeling (access switches strip away first, then
+aggregation, leaving the core — robust on dual-homed designs, with VSX
+partners always kept together) and forms the top row, and every further tier is one hop down, so a 3-tier campus renders
 as core / aggregation / access rows with endpoints hanging below their
 switch. Rows are barycentre-ordered to keep access switches under
 their own aggregation and minimise crossing links. If auto-detection
