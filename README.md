@@ -13,15 +13,19 @@ with credentials and it maps what it finds.
 - Python 3.9+ (tested on 3.12)
 - `requests` (`pip install requests`)
 - AOS-CX 10.04 or later (10.16 fully supported) with the REST API enabled (`https-server rest access-mode read-write` is not required — read-only is sufficient)
-- A local account or TACACS/RADIUS account with at least operator rights
+- One or more accounts with at least operator rights (local or TACACS/RADIUS)
 
 ## Quick start
 
 ```bash
 export AOSCX_PASSWORD='...'          # or omit to be prompted
-python3 lldp_mapper.py scan 10.20.30.0/24 -u admin \
-    -o topology.drawio --json inventory.json
+python3 lldp_mapper.py scan 10.20.30.0/24 -u admin
 ```
+
+This writes `topology.drawio` and a matching `topology.json` inventory
+(used by diff mode) — both by default. Use `-o` to rename (the JSON
+follows the diagram name), `--json` to place the inventory elsewhere,
+or `--no-json` to skip it.
 
 Open `topology.drawio` in [draw.io](https://app.diagrams.net) or the
 desktop app. Each view is a **page** — tabs along the bottom of the
@@ -46,7 +50,11 @@ beside the switch it belongs to — so there is no ambiguity about
 which port is which. VSX pairs are placed side
 by side inside a dashed container with their role (primary/secondary)
 in the node label. Add `--include-endpoints` to also show APs, phones,
-and servers seen in LLDP as dashed grey leaf nodes.
+and servers seen in LLDP as dashed grey leaf nodes — on both the
+physical page and the Layer 2 page, where endpoint links are labelled
+with the switch-side port's VLAN config (access VLAN or trunk list).
+This is also what makes single-switch or single-stack environments
+produce a useful Layer 2 page, since they have no inter-switch links.
 
 **2 — Layer 2 (LAGs / VLANs)** — physical links collapsed into their
 LAGs using each switch's LAG member lists, so a dual-cable VSX ISL
@@ -59,6 +67,10 @@ and trunk lists are range-compressed.
 labelled with both interface IPs; subnets spanning three or more
 switches render as a green subnet hub with a spoke per switch.
 Loopbacks (/32) are excluded. Non-default VRFs are named in the label.
+By default the page shows only *shared* subnets (adjacency); add
+`--all-subnets` to also render subnets attached to a single switch —
+every SVI and routed port as a leaf node — which is what gives a
+single-switch or single-stack estate a complete L3 page.
 
 **4 — Routing (OSPF / BGP)** — live protocol adjacencies. OSPF
 neighbours (orange, `area 0.0.0.0 · FULL`) are matched to inventory by
@@ -67,9 +79,33 @@ iBGP/eBGP distinguished with AS numbers and session state) by peer IP.
 Peers that aren't in the scanned inventory — WAN routers, firewalls —
 appear as amber "external peer" nodes rather than being dropped.
 
+## Multiple credentials
+
+Mixed-credential subnets are supported — credentials are tried in
+order per switch until one authenticates:
+
+```bash
+# interactive: prompted for each account's password, nothing on disk
+python3 lldp_mapper.py scan 10.20.30.0/24 -u admin -u svc_net
+
+# scheduled jobs: JSON file (chmod 600), tried before any -u accounts
+python3 lldp_mapper.py scan 10.20.30.0/24 --creds /etc/lldp-mapper/creds.json
+```
+
+`creds.json` is a list: `[{"username": "admin", "password": "..."},
+{"username": "svc_net", "password": "..."}]`.
+
+Only an authentication rejection (HTTP 401) moves on to the next
+credential; unreachable hosts abort immediately so they don't burn
+attempts. Order the list most-likely-first: each wrong credential is a
+failed login on that switch, which counts against any account-lockout
+policy your AAA enforces. The scan log shows which username succeeded
+per switch.
+
 ## Diff mode
 
-Save `--json` inventories from each run, then compare:
+Every scan writes a JSON inventory alongside the diagram by default —
+keep them (dated filenames help) and compare any two:
 
 ```bash
 python3 lldp_mapper.py diff last-week.json today.json -o diff.drawio
@@ -87,7 +123,9 @@ during migrations.
 | Flag | Default | Notes |
 |---|---|---|
 | `-o, --output` | `topology.drawio` | draw.io output path |
-| `--json FILE` | off | also write JSON inventory (needed for diff) |
+| `--json FILE` | derived from `-o` | JSON inventory path (needed for diff) |
+| `--no-json` | off | skip the JSON inventory |
+| `--all-subnets` | off | render single-attached subnets (SVIs, uplink /30s) as leaf nodes on the L3 page |
 | `--layered` | off | single page with toggleable layers instead of one page per view |
 | `--include-endpoints` | off | show non-switch LLDP neighbours |
 | `--physical-only` | off | skip L2/L3/routing collection entirely |

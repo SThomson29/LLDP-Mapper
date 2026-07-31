@@ -577,47 +577,66 @@ def scan_subnet(cidr: str, workers: int = 64) -> list[str]:
     return sorted(alive, key=ipaddress.ip_address)
 
 
-def poll_device(ip: str, username: str, password: str, api_version: str,
-                verify: bool, want_details: bool = True,
+def poll_device(ip: str, credentials: list[tuple[str, str]],
+                api_version: str, verify: bool, want_details: bool = True,
                 want_routing: bool = True) -> PollResult | None:
-    """Log into one switch and gather everything in a single session."""
-    details: dict[str, PortInfo] = {}
-    vsx: VsxInfo | None = None
-    ospf: list[dict] = []
-    bgp: list[dict] = []
-    try:
-        with AosCxRest(ip, username, password, api_version, verify) as api:
-            negotiated = api.api_version
-            sysinfo = api.system_info()
-            lldp = api.lldp_neighbors()
-            if want_details:
-                details = api.interface_details()
-                vsx = api.vsx_info()
-            if want_routing:
-                ospf = api.ospf_neighbors()
-                bgp = api.bgp_neighbors()
-    except requests.HTTPError as exc:
-        code = exc.response.status_code if exc.response is not None else "?"
-        log.warning("%s: REST error %s — skipping (not AOS-CX, or bad creds)",
-                    ip, code)
-        return None
-    except requests.RequestException as exc:
-        log.warning("%s: unreachable via REST (%s)", ip, type(exc).__name__)
-        return None
+    """Log into one switch and gather everything in a single session.
 
-    dev = Device(
-        key=normalise_mac(sysinfo.get("system_mac", "")) or ip,
-        hostname=sysinfo.get("hostname", ""),
-        mgmt_ip=ip,
-        platform=sysinfo.get("platform_name", ""),
-        version=str(sysinfo.get("software_version", "")),
-        is_switch=True,
-    )
-    n_nbrs = sum(len(v) for v in lldp.values())
-    log.info("%s (%s, %s): %d LLDP neighbour(s) on %d interface(s)",
-             dev.hostname or ip, ip, negotiated, n_nbrs, len(lldp))
-    return PollResult(device=dev, lldp=lldp, details=details,
-                      vsx=vsx, ospf=ospf, bgp=bgp)
+    Credentials are (username, password) pairs tried in order. Only an
+    authentication rejection (HTTP 401) advances to the next pair —
+    connection failures and other errors abort the device immediately,
+    so unreachable hosts don't burn attempts against lockout policies.
+    """
+    for username, password in credentials:
+        details: dict[str, PortInfo] = {}
+        vsx: VsxInfo | None = None
+        ospf: list[dict] = []
+        bgp: list[dict] = []
+        try:
+            with AosCxRest(ip, username, password,
+                           api_version, verify) as api:
+                negotiated = api.api_version
+                sysinfo = api.system_info()
+                lldp = api.lldp_neighbors()
+                if want_details:
+                    details = api.interface_details()
+                    vsx = api.vsx_info()
+                if want_routing:
+                    ospf = api.ospf_neighbors()
+                    bgp = api.bgp_neighbors()
+        except requests.HTTPError as exc:
+            code = (exc.response.status_code
+                    if exc.response is not None else 0)
+            if code == 401:
+                log.debug("%s: auth rejected for '%s', trying next "
+                          "credential", ip, username)
+                continue
+            log.warning("%s: REST error %s — skipping (not AOS-CX?)",
+                        ip, code or "?")
+            return None
+        except requests.RequestException as exc:
+            log.warning("%s: unreachable via REST (%s)",
+                        ip, type(exc).__name__)
+            return None
+
+        dev = Device(
+            key=normalise_mac(sysinfo.get("system_mac", "")) or ip,
+            hostname=sysinfo.get("hostname", ""),
+            mgmt_ip=ip,
+            platform=sysinfo.get("platform_name", ""),
+            version=str(sysinfo.get("software_version", "")),
+            is_switch=True,
+        )
+        n_nbrs = sum(len(v) for v in lldp.values())
+        log.info("%s (%s, %s, user '%s'): %d LLDP neighbour(s) on %d "
+                 "interface(s)", dev.hostname or ip, ip, negotiated,
+                 username, n_nbrs, len(lldp))
+        return PollResult(device=dev, lldp=lldp, details=details,
+                          vsx=vsx, ospf=ospf, bgp=bgp)
+
+    log.warning("%s: all %d credential(s) rejected — skipping",
+                ip, len(credentials))
+    return None
 
 
 def neighbor_to_device(nbr: dict) -> Device:
@@ -694,17 +713,29 @@ def _vlan_label(p: PortInfo | None) -> str:
 
 
 def build_l2_edges(topo: Topology,
-                   details_by_dev: dict[str, dict[str, PortInfo]]
-                   ) -> list[L2Edge]:
-    """Collapse physical switch-to-switch links into LAG-level L2 links."""
+                   details_by_dev: dict[str, dict[str, PortInfo]],
+                   include_endpoints: bool = False) -> list[L2Edge]:
+    """Collapse physical links into LAG-level L2 links with VLAN labels.
+
+    Switch-to-switch links always included. With include_endpoints,
+    links to non-switch neighbours (APs, phones, servers) are also
+    shown, labelled with the switch-side port's VLAN config — useful
+    for single-switch/stack environments that have no inter-switch
+    links, and for auditing edge-port membership generally.
+    """
     grouped: dict[tuple, L2Edge] = {}
     for edge in topo.edges.values():
         da = topo.devices.get(edge.a_key)
         db = topo.devices.get(edge.b_key)
-        if not (da and db and da.is_switch and db.is_switch):
+        if not (da and db):
+            continue
+        both_switches = da.is_switch and db.is_switch
+        if not both_switches and not (include_endpoints
+                                      and (da.is_switch or db.is_switch)):
             continue
         det_a = details_by_dev.get(edge.a_key, {})
         det_b = details_by_dev.get(edge.b_key, {})
+        # LAG resolution only applies where we have the switch's config.
         if_a = _member_to_lag(det_a).get(edge.a_port, edge.a_port)
         if_b = _member_to_lag(det_b).get(edge.b_port, edge.b_port)
 
@@ -713,7 +744,8 @@ def build_l2_edges(topo: Topology,
         if key in grouped:
             grouped[key].member_count += 1
             continue
-        # VLAN config lives on the aggregated interface (LAG or port).
+        # VLAN config lives on the aggregated interface (LAG or port),
+        # read from whichever side is a switch we polled.
         label = _vlan_label(det_a.get(if_a)) or _vlan_label(det_b.get(if_b))
         grouped[key] = L2Edge(
             a_key=ends[0][0], a_if=ends[0][1],
@@ -735,9 +767,16 @@ class L3Segment:
         return f"{vrf}{self.network}"
 
 
-def build_l3_segments(details_by_dev: dict[str, dict[str, PortInfo]]
-                      ) -> list[L3Segment]:
-    """Group SVI/routed-port IPs into shared (vrf, subnet) segments."""
+def build_l3_segments(details_by_dev: dict[str, dict[str, PortInfo]],
+                      include_single: bool = False) -> list[L3Segment]:
+    """Group SVI/routed-port IPs into shared (vrf, subnet) segments.
+
+    By default only segments connecting 2+ devices are returned — the
+    L3 page shows adjacency. With include_single, subnets attached to
+    just one device (SVIs unique to a switch, uplink /30s to unpolled
+    routers) are also returned, rendered as leaf subnet nodes; this is
+    what gives a single switch or stack a meaningful L3 page.
+    """
     segments: dict[tuple, L3Segment] = {}
     for dev_key, details in details_by_dev.items():
         for p in details.values():
@@ -756,8 +795,8 @@ def build_l3_segments(details_by_dev: dict[str, dict[str, PortInfo]]
                 if p.is_svi and p.svi_vlan is not None:
                     detail = f"vlan {p.svi_vlan} · {iface.ip}"
                 seg.members[dev_key] = detail
-    # Only segments connecting 2+ devices are topology-relevant.
-    return [s for s in segments.values() if len(s.members) >= 2]
+    min_members = 1 if include_single else 2
+    return [s for s in segments.values() if len(s.members) >= min_members]
 
 
 # --------------------------------------------------------------------------
@@ -1180,15 +1219,20 @@ def _render_l2(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
     _vsx_boxes(xb, parent, pos, vsx_pairs, l2_devs)
     ids: dict[str, str] = {}
     for key in l2_devs:
-        dev = topo.devices[key]
+        dev = topo.devices.get(key)
+        if dev is None:
+            continue
         x, y = pos.get(key, (100, 100))
-        ids[key] = xb.node(parent, dev.label, SWITCH_STYLE, x, y)
+        style = SWITCH_STYLE if dev.is_switch else ENDPOINT_STYLE
+        ids[key] = xb.node(parent, dev.label, style, x, y)
     for e in l2_edges:
         bits = []
         if e.member_count > 1:
             bits.append(f"{e.member_count}x links")
         if e.vlan_label:
             bits.append(e.vlan_label)
+        if e.a_key not in ids or e.b_key not in ids:
+            continue
         xb.edge(parent, "\n".join(bits), L2_EDGE_STYLE,
                 ids[e.a_key], ids[e.b_key],
                 src_label=e.a_if, dst_label=e.b_if,
@@ -1206,11 +1250,25 @@ def _render_l3(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
             continue
         x, y = pos.get(key, (100, 100))
         ids[key] = xb.node(parent, dev.label, SWITCH_STYLE, x, y)
+    # Leaf subnets (single member) fan out around their switch.
+    leaf_count: dict[str, int] = {}
     for seg in l3_segments:
         members = [k for k in seg.members if k in ids]
-        if len(members) < 2:
+        if len(members) < 1:
             continue
-        if len(members) == 2:
+        if len(members) == 1:
+            k = members[0]
+            j = leaf_count.get(k, 0)
+            leaf_count[k] = j + 1
+            sx, sy = pos.get(k, (100, 100))
+            ang = -math.pi / 2 + j * (math.pi / 5)
+            lx = sx + 260 * math.cos(ang)
+            ly = sy + 260 * math.sin(ang)
+            leaf = xb.node(parent, seg.label, SUBNET_STYLE, lx, ly,
+                           w=160, h=50)
+            xb.edge(parent, "", L3_EDGE_STYLE, ids[k], leaf,
+                    dst_label=seg.members[k])
+        elif len(members) == 2:
             a, b = members
             xb.edge(parent, seg.label, L3_EDGE_STYLE, ids[a], ids[b],
                     src_label=seg.members[a], dst_label=seg.members[b],
@@ -1414,15 +1472,29 @@ def main(argv: list[str] | None = None) -> int:
 
     scan = sub.add_parser("scan", help="scan a subnet and map the topology")
     scan.add_argument("subnet", help="CIDR to scan, e.g. 10.20.30.0/24")
-    scan.add_argument("-u", "--username", required=True)
+    scan.add_argument("-u", "--username", action="append", default=[],
+                      help="username to try; repeat for multiple accounts "
+                           "(tried in order per switch, prompted for each "
+                           "password)")
+    scan.add_argument("--creds", metavar="FILE",
+                      help="JSON file: [{\"username\": ..., \"password\": "
+                           "...}, ...] tried in order per switch (before "
+                           "any -u accounts)")
     scan.add_argument("-o", "--output", default="topology.drawio",
                       help="draw.io output file (default: topology.drawio)")
-    scan.add_argument("--json", metavar="FILE",
-                      help="also write the raw topology as JSON")
+    scan.add_argument("--json", metavar="FILE", default=None,
+                      help="JSON inventory path (default: derived from -o, "
+                           "e.g. topology.json). Needed for diff mode.")
+    scan.add_argument("--no-json", action="store_true",
+                      help="skip writing the JSON inventory")
     scan.add_argument("--api-version", default=DEFAULT_API_VERSION,
                       help="'auto' negotiates the latest version via GET "
                            "/rest (v10.16 on 10.16 firmware); or pin one, "
                            "e.g. v10.04 (default: auto)")
+    scan.add_argument("--all-subnets", action="store_true",
+                      help="include subnets attached to only one switch "
+                           "(SVIs, uplink /30s) as leaf nodes on the L3 "
+                           "page — needed for single-switch/stack estates")
     scan.add_argument("--layered", action="store_true",
                       help="single page with toggleable layers instead of "
                            "one page per view")
@@ -1473,9 +1545,45 @@ def run_diff(args) -> int:
     return 0 if diff.empty else 2
 
 
+def gather_credentials(args) -> list[tuple[str, str]]:
+    """Assemble the ordered credential list from --creds and -u.
+
+    File entries come first, then CLI usernames. A single -u with
+    AOSCX_PASSWORD set keeps the original non-interactive behaviour;
+    otherwise each CLI username is prompted for its password.
+    """
+    creds: list[tuple[str, str]] = []
+    if args.creds:
+        try:
+            with open(args.creds) as f:
+                entries = json.load(f)
+        except (OSError, ValueError) as exc:
+            log.error("cannot read credentials file %s: %s",
+                      args.creds, exc)
+            return []
+        mode = os.stat(args.creds).st_mode & 0o077
+        if mode:
+            log.warning("%s is readable by group/other — consider "
+                        "chmod 600", args.creds)
+        for e in entries if isinstance(entries, list) else []:
+            if isinstance(e, dict) and e.get("username"):
+                creds.append((str(e["username"]),
+                              str(e.get("password", ""))))
+    env_pw = os.environ.get("AOSCX_PASSWORD")
+    for i, user in enumerate(args.username):
+        if env_pw and len(args.username) == 1 and not args.creds:
+            creds.append((user, env_pw))
+        else:
+            creds.append((user, getpass.getpass(
+                f"Password for {user}: ")))
+    return creds
+
+
 def run_scan(args) -> int:
-    password = os.environ.get("AOSCX_PASSWORD") or getpass.getpass(
-        f"Password for {args.username}: ")
+    credentials = gather_credentials(args)
+    if not credentials:
+        log.error("no credentials supplied — use -u and/or --creds")
+        return 1
 
     candidates = scan_subnet(args.subnet, workers=args.scan_workers)
     if not candidates:
@@ -1487,7 +1595,7 @@ def run_scan(args) -> int:
     polled: list[PollResult] = []
     with cf.ThreadPoolExecutor(max_workers=args.poll_workers) as pool:
         futures = [
-            pool.submit(poll_device, ip, args.username, password,
+            pool.submit(poll_device, ip, credentials,
                         args.api_version, args.verify_ssl,
                         want_details, want_routing)
             for ip in candidates
@@ -1506,8 +1614,10 @@ def run_scan(args) -> int:
     l2_edges, l3_segments, routing_adjs, vsx_pairs = None, None, None, None
     if want_details:
         details_by_dev = {pr.device.key: pr.details for pr in polled}
-        l2_edges = build_l2_edges(topo, details_by_dev)
-        l3_segments = build_l3_segments(details_by_dev)
+        l2_edges = build_l2_edges(topo, details_by_dev,
+                                  args.include_endpoints)
+        l3_segments = build_l3_segments(details_by_dev,
+                                        args.all_subnets)
         vsx_pairs = detect_vsx_pairs(polled)
         log.info("L2 layer: %d aggregated link(s); L3 layer: %d segment(s); "
                  "VSX pairs: %d",
@@ -1529,10 +1639,14 @@ def run_scan(args) -> int:
          "layers: View > Layers" if args.layered
          else "one page per view — tabs at the bottom")
 
-    if args.json:
-        with open(args.json, "w") as f:
+    if not args.no_json:
+        json_path = args.json
+        if not json_path:
+            root, _ = os.path.splitext(args.output)
+            json_path = f"{root}.json"
+        with open(json_path, "w") as f:
             f.write(to_json(topo, routing_adjs, vsx_pairs))
-        log.info("JSON inventory written to %s", args.json)
+        log.info("JSON inventory written to %s", json_path)
     return 0
 
 
