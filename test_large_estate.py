@@ -227,3 +227,56 @@ extra = [p for p, filt in SviFake.calls
          if p == "/system/interfaces/vlan50"]
 assert len(extra) == 1
 print("down-SVI fallback OK (address recovered via unfiltered re-fetch)")
+
+# --- crossed patching: primary-parent port ordering --------------------------
+xt = _T()
+xk = {}
+for i, n in enumerate(["par-01", "par-02", "child-x", "child-y"]):
+    xk[n] = f"ee:00:00:00:00:1{i}"
+    xt.upsert_device(_D(key=xk[n], hostname=n, is_switch=True))
+xt.add_edge(_E(a_key=xk["par-01"], a_port="1/1/49",
+               b_key=xk["par-02"], b_port="1/1/49"))
+# child-x: par-01 port 1/1/2, but par-02 port 1/1/1 (crossed)
+xt.add_edge(_E(a_key=xk["par-01"], a_port="1/1/2",
+               b_key=xk["child-x"], b_port="1/1/51"))
+xt.add_edge(_E(a_key=xk["par-02"], a_port="1/1/1",
+               b_key=xk["child-x"], b_port="1/1/52"))
+# child-y: par-01 port 1/1/1, par-02 port 1/1/2
+xt.add_edge(_E(a_key=xk["par-01"], a_port="1/1/1",
+               b_key=xk["child-y"], b_port="1/1/51"))
+xt.add_edge(_E(a_key=xk["par-02"], a_port="1/1/2",
+               b_key=xk["child-y"], b_port="1/1/52"))
+xpos = _layout(xt, [(xk["par-01"], xk["par-02"])])
+# primary parent is par-01: its 1/1/1 (child-y) must sort left of 1/1/2
+assert xpos[xk["child-y"]][0] < xpos[xk["child-x"]][0], (
+    xpos[xk["child-y"]][0], xpos[xk["child-x"]][0])
+print("crossed-patching ordering OK (primary parent's ports decide)")
+
+# --- p2p merge: subnet + OSPF adjacency render as ONE edge -------------------
+merge_segs = [L3Segment(vrf="default", network="10.255.1.0/31",
+                        members={K["agg-1a"]: "1/1/20 · 10.255.1.0",
+                                 K["acc-11"]: "1/1/48 · 10.255.1.1"})]
+merge_adjs = [a for a in adjs] + [
+    __import__("lldp_mapper").RoutingAdj(
+        protocol="ospf", vrf="default", a_key=K["agg-1a"],
+        b_key=K["acc-11"], detail="area 0.0.0.0", state="FULL")]
+mxml = to_drawio_xml(topo, l3_segments=merge_segs,
+                     routing_adjs=merge_adjs, vsx_pairs=pairs)
+mroot = ET.fromstring(mxml)
+mb1 = next(d for d in mroot.findall("diagram")
+           if d.get("name") == "agg-1 L3")
+mcells = list(mb1.iter())
+medges = [c for c in mcells if c.get("edge")]
+# page carries the merged /31 plus the agg pair's iBGP: exactly 2 edges,
+# and the /31 pair (agg-1a <-> acc-11) has ONE edge, carrying both the
+# subnet and the OSPF state — the adjacency wasn't drawn in parallel.
+assert len(medges) == 2, len(medges)
+node_of = {c.get("id"): (c.get("value") or "").split("\n")[0]
+           for c in mcells if c.get("vertex") == "1"}
+pair_edges = [c for c in medges
+              if {node_of.get(c.get("source")),
+                  node_of.get(c.get("target"))} == {"agg-1a", "acc-11"}]
+assert len(pair_edges) == 1, len(pair_edges)
+lbl = pair_edges[0].get("value") or ""
+assert "10.255.1.0/31" in lbl and "OSPF FULL" in lbl, lbl
+print("p2p merge OK (one edge per /31: subnet + OSPF FULL combined)")

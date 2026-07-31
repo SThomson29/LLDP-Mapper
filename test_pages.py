@@ -147,11 +147,12 @@ import csv as _csv
 import os as _os
 from lldp_mapper import _ipam_rows, write_ipam_csv
 
+stack_det["vlan20"].active_gateway = "10.20.0.254"   # VSX AG on vlan20
 rows = _ipam_rows(stack_det)
-assert ("vlan20", "20", "10.20.0.1/24", "default") in rows
-assert ("vlan30", "30", "10.30.0.1/24", "CORP") in rows
-assert ("1/1/48", "", "192.168.255.0/31", "default") in rows
-assert ("loopback0", "", "192.168.0.9/32", "default") in rows
+assert ("vlan20", "20", "10.20.0.1/24", "default", "10.20.0.254") in rows
+assert ("vlan30", "30", "10.30.0.1/24", "CORP", "N/A") in rows
+assert ("1/1/48", "", "192.168.255.0/31", "default", "N/A") in rows
+assert ("loopback0", "", "192.168.0.9/32", "default", "N/A") in rows
 assert rows[0][0] == "vlan20" and rows[1][0] == "vlan30"
 print("IPAM rows OK (SVIs, routed port, loopback, VRF, sorted)")
 
@@ -160,12 +161,15 @@ with open("ipam_test.csv") as f:
     recs = list(_csv.DictReader(f))
 assert n == len(recs) == len(rows)
 r30 = next(r for r in recs if r["interface"] == "vlan30")
-assert r30 == {"hostname": "stack-01", "mgmt_ip": "10.9.0.1",
-               "interface": "vlan30", "vlan": "30", "ip": "10.30.0.1",
-               "prefix": "24", "network": "10.30.0.0/24", "vrf": "CORP"}
-# network column answers "who is on this subnet"
+assert r30 == {"hostname": "stack-01", "interface": "vlan30",
+               "vlan": "30", "ip": "10.30.0.1", "prefix": "24",
+               "network": "10.30.0.0/24", "vrf": "CORP",
+               "active_gateway": "N/A"}
+r20 = next(r for r in recs if r["interface"] == "vlan20")
+assert r20["active_gateway"] == "10.20.0.254"
+# bare port numbers get the Interface prefix so Excel keeps them text
 assert [r["interface"] for r in recs
-        if r["network"] == "192.168.255.0/31"] == ["1/1/48"]
+        if r["network"] == "192.168.255.0/31"] == ["Interface 1/1/48"]
 _os.remove("ipam_test.csv")
 print("IPAM CSV OK (flat rows, split ip/prefix/network, filterable)")
 

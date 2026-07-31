@@ -121,8 +121,12 @@ diagram; override with `--ipam FILE`, skip with `--no-ipam`). One row per config
 port, and loopback:
 
 ```
-hostname, mgmt_ip, interface, vlan, ip, prefix, network, vrf
+hostname, interface, vlan, ip, prefix, network, vrf, active_gateway
 ```
+
+Bare port numbers are written as `Interface 1/1/1` so spreadsheets
+don't parse them as dates. The `active_gateway` column carries the VSX
+active-gateway VIP where configured, `N/A` otherwise.
 
 It opens directly in Excel and filters/sorts like the IPAM it
 effectively is — the `network` column answers "what's on this subnet"
@@ -217,9 +221,11 @@ grouped so you review one area completely before the next: **Overview**
 **Core L3** (core-pair routed relations), then the **Core-Agg** set —
 L1 (the full core-to-distribution cabling with port detail), L2, L3
 (interconnect subnets and adjacencies), IPAM (core + agg addressing) —
-then per block: **agg-1 L1 / L2 / L3 / IPAM** and so on. L3 pages
-combine subnets with routing adjacencies, which suits point-to-point
-OSPF designs where a global routed view becomes unreadable. Within
+then per block: **agg-1 L1 / L2 / L3 / IPAM** and so on. On L3 pages, a point-to-point subnet and the
+adjacency running over it merge into a single edge — `10.255.1.0/31`
+plus `OSPF FULL` on one link, rather than parallel subnet and protocol
+edges — which is what keeps p2p-heavy designs readable; adjacencies
+with no matching collected subnet still draw separately. Within
 every row, switches are ordered by their uplink's parent-side interface
 number, so the diagram matches the physical patching. Control with
 `--split always|never|auto`.

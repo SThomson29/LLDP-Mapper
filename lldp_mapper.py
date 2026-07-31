@@ -106,6 +106,7 @@ class PortInfo:
     ip4: list[str] = field(default_factory=list)   # CIDR strings
     vrf: str = "default"
     lag_members: list[str] = field(default_factory=list)  # set on lagN ifs
+    active_gateway: str = ""     # VSX active-gateway VIP, if configured
 
     @property
     def is_lag(self) -> bool:
@@ -365,8 +366,15 @@ class AosCxRest:
                 result[ifname] = neighbors
         return result
 
-    IF_ATTRS = ("vlan_mode,vlan_tag,vlan_trunks,ip4_address,"
-                "ip4_address_secondary,interfaces,vrf")
+    IF_ATTRS_BASE = ("vlan_mode,vlan_tag,vlan_trunks,ip4_address,"
+                     "ip4_address_secondary,interfaces,vrf")
+    # vsx_virtual_ip4 = active-gateway VIP list; requested opportunistically
+    # and dropped for the session if any firmware rejects the attribute.
+    IF_ATTRS = IF_ATTRS_BASE + ",vsx_virtual_ip4"
+
+    def _if_attrs(self) -> str:
+        return (self.IF_ATTRS_BASE if getattr(self, "_no_vsx_vip", False)
+                else self.IF_ATTRS)
 
     def vsx_info(self) -> VsxInfo | None:
         """Return VSX config, or None if the switch isn't a VSX member.
@@ -504,8 +512,22 @@ class AosCxRest:
 
     def _interface_details_raw(self) -> dict[str, PortInfo]:
         try:
-            data = self.get("/system/interfaces/*",
-                            params={"attributes": self.IF_ATTRS, "depth": 2})
+            try:
+                data = self.get("/system/interfaces/*",
+                                params={"attributes": self._if_attrs(),
+                                        "depth": 2})
+            except requests.HTTPError as exc:
+                if (exc.response is not None
+                        and exc.response.status_code == 400
+                        and not getattr(self, "_no_vsx_vip", False)):
+                    log.debug("%s: vsx_virtual_ip4 unsupported, retrying "
+                              "without it", self.host)
+                    self._no_vsx_vip = True
+                    data = self.get("/system/interfaces/*",
+                                    params={"attributes": self._if_attrs(),
+                                            "depth": 2})
+                else:
+                    raise
             return {urllib.parse.unquote(k): self._parse_port(
                         urllib.parse.unquote(k), v)
                     for k, v in (data or {}).items() if isinstance(v, dict)}
@@ -517,7 +539,7 @@ class AosCxRest:
             enc = urllib.parse.quote(ifname, safe="")
             try:
                 data = self.get(f"/system/interfaces/{enc}",
-                                params={"attributes": self.IF_ATTRS,
+                                params={"attributes": self._if_attrs(),
                                         "depth": 1})
             except requests.HTTPError:
                 continue
@@ -547,6 +569,13 @@ class AosCxRest:
             if isinstance(data.get("vrf"), dict) else data.get("vrf")
         ) or "default"
         p.lag_members = _keys_or_uris(data.get("interfaces"))
+        vip = data.get("vsx_virtual_ip4")
+        if isinstance(vip, list) and vip:
+            p.active_gateway = str(vip[0]).split("/")[0]
+        elif isinstance(vip, dict) and vip:
+            p.active_gateway = str(next(iter(vip))).split("/")[0]
+        elif isinstance(vip, str) and vip:
+            p.active_gateway = vip.split("/")[0]
         return p
 
     @staticmethod
@@ -790,10 +819,13 @@ class L3Segment:
     network: str                       # e.g. "10.1.10.0/24"
     members: dict[str, str] = field(default_factory=dict)  # dev_key -> detail
 
+    proto_note: str = ""                # e.g. "OSPF FULL" when merged
+
     @property
     def label(self) -> str:
         vrf = "" if self.vrf == "default" else f"vrf {self.vrf} · "
-        return f"{vrf}{self.network}"
+        base = f"{vrf}{self.network}"
+        return f"{base}\n{self.proto_note}" if self.proto_note else base
 
 
 def build_l3_segments(details_by_dev: dict[str, dict[str, PortInfo]],
@@ -1254,12 +1286,15 @@ def _layout_tiered(topo: Topology,
                 best = (min(votes, key=lambda k: (-votes[k], k))
                         if votes else 10**6)
                 groups.setdefault(best, []).append(unit)
-            # Within a group, order children by the lowest parent-side
-            # interface number of their uplink, so the diagram matches
-            # the physical patching (core 1/1/1 -> first agg, etc.).
+            # Within a group, order children by the interface number on
+            # the PRIMARY parent (first member of the parent unit by
+            # hostname, i.e. the -01/-a device). Taking the minimum
+            # across both VSX members is wrong under crossed patching:
+            # a child on core-01:1/1/2 + core-02:1/1/1 must sort by
+            # 1/1/2, not steal first place via core-02.
             def uplink_port_key(unit):
-                best = (10**9,)
                 unit_set = set(unit)
+                ports_by_parent: dict[str, tuple] = {}
                 for e in topo.edges.values():
                     for child, parent, pport in (
                             (e.a_key, e.b_key, e.b_port),
@@ -1267,9 +1302,15 @@ def _layout_tiered(topo: Topology,
                         if (child in unit_set
                                 and depths.get(parent, 99) == t - 1):
                             k = _port_sort_key(pport)
-                            if k < best:
-                                best = k
-                return (best, topo.devices[unit[0]].hostname or unit[0])
+                            if k < ports_by_parent.get(parent, (10**9,)):
+                                ports_by_parent[parent] = k
+                for parent in sorted(
+                        ports_by_parent,
+                        key=lambda p: topo.devices[p].hostname or p):
+                    return (ports_by_parent[parent],
+                            topo.devices[unit[0]].hostname or unit[0])
+                return ((10**9,),
+                        topo.devices[unit[0]].hostname or unit[0])
             ordered: list[list[str]] = []
             for gi in sorted(groups):
                 ordered.extend(sorted(groups[gi], key=uplink_port_key))
@@ -1802,13 +1843,22 @@ def _scope_of_pair(info: "ScopeInfo", a: str, b: str) -> tuple:
     return ("coreagg",)
 
 
+def _csv_interface_name(name: str) -> str:
+    """Prefix bare port numbers so spreadsheets don't parse 1/1/1 as a
+    date."""
+    if re.fullmatch(r"\d+(/\d+)*", name):
+        return f"Interface {name}"
+    return name
+
+
 def _ipam_rows(details: dict[str, "PortInfo"]) -> list[tuple]:
     rows = []
     for p in details.values():
         for addr in p.ip4:
             vlan = str(p.svi_vlan) if p.svi_vlan is not None else ""
+            ag = p.active_gateway or "N/A"
             rows.append((p.svi_vlan if p.svi_vlan is not None else 10**6,
-                         p.name, vlan, addr, p.vrf))
+                         p.name, vlan, addr, p.vrf, ag))
     rows.sort()
     return [r[1:] for r in rows]
 
@@ -1824,15 +1874,16 @@ def write_ipam_csv(path: str, topo: Topology,
     count = 0
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["hostname", "mgmt_ip", "interface", "vlan",
-                    "ip", "prefix", "network", "vrf"])
+        w.writerow(["hostname", "interface", "vlan", "ip", "prefix",
+                    "network", "vrf", "active_gateway"])
         for key in sorted(port_details,
                           key=lambda k: (topo.devices[k].hostname or k)
                           if k in topo.devices else k):
             dev = topo.devices.get(key)
             if dev is None:
                 continue
-            for ifname, vlan, addr, vrf in _ipam_rows(port_details[key]):
+            for ifname, vlan, addr, vrf, ag in _ipam_rows(
+                    port_details[key]):
                 try:
                     iface = ipaddress.ip_interface(addr)
                     ip_s = str(iface.ip)
@@ -1840,8 +1891,9 @@ def write_ipam_csv(path: str, topo: Topology,
                     network = str(iface.network)
                 except ValueError:
                     ip_s, prefix, network = addr, "", ""
-                w.writerow([dev.hostname or key, dev.mgmt_ip, ifname,
-                            vlan, ip_s, prefix, network, vrf])
+                w.writerow([dev.hostname or key,
+                            _csv_interface_name(ifname), vlan, ip_s,
+                            prefix, network, vrf, ag])
                 count += 1
     return count
 
@@ -1930,7 +1982,33 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
     pages.append(("Overview", "page-overview", render_overview))
 
     # ---- Core L3 (core-only routed relations) --------------------------
+    def merge_p2p(segs, adjs):
+        """Fold adjacencies into their matching point-to-point subnet:
+        one edge labelled 'subnet + OSPF FULL' instead of two parallel
+        edges per link. Unmatched adjacencies are returned to draw."""
+        merged_segs, leftover = [], list(adjs)
+        for s in segs:
+            if len(s.members) == 2:
+                pair = set(s.members)
+                notes = []
+                still = []
+                for a in leftover:
+                    if (a.b_key and {a.a_key, a.b_key} == pair
+                            and a.vrf == s.vrf):
+                        notes.append(f"{a.protocol.upper()} "
+                                     f"{a.state}".strip())
+                    else:
+                        still.append(a)
+                leftover = still
+                if notes:
+                    s = L3Segment(vrf=s.vrf, network=s.network,
+                                  members=dict(s.members),
+                                  proto_note=" · ".join(sorted(set(notes))))
+            merged_segs.append(s)
+        return merged_segs, leftover
+
     def routed_page(name, pid, segs, adjs):
+        segs, adjs = merge_p2p(segs, adjs)
         if not segs and not adjs:
             return
         def render(xb, segs=segs, adjs=adjs):
