@@ -1,0 +1,5 @@
+[
+  {"username": "svc_netscan", "password": "CHANGE-ME"},
+  {"username": "admin", "password": "CHANGE-ME-TOO"},
+  {"username": "legacy_local", "password": "OLD-SITE-PASSWORD"}
+]
