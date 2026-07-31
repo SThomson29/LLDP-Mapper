@@ -996,7 +996,182 @@ EDGE_STYLE = (
 NODE_W, NODE_H = 200, 60
 
 
+def _switch_adjacency(topo: Topology) -> dict[str, set[str]]:
+    adj: dict[str, set[str]] = {d.key: set() for d in topo.devices.values()
+                                if d.is_switch}
+    for e in topo.edges.values():
+        if e.a_key in adj and e.b_key in adj:
+            adj[e.a_key].add(e.b_key)
+            adj[e.b_key].add(e.a_key)
+    return adj
+
+
+def _bfs_depths(adj: dict[str, set[str]], roots: list[str]) -> dict[str, int]:
+    depths = {r: 0 for r in roots}
+    frontier = list(roots)
+    while frontier:
+        nxt = []
+        for n in frontier:
+            for m in adj.get(n, ()):
+                if m not in depths:
+                    depths[m] = depths[n] + 1
+                    nxt.append(m)
+        frontier = nxt
+    return depths
+
+
+def _graph_centre(adj: dict[str, set[str]], nodes: list[str]) -> list[str]:
+    """Nodes with minimum eccentricity — the core of a hierarchy."""
+    best_ecc, centre = None, []
+    for n in nodes:
+        depths = _bfs_depths(adj, [n])
+        ecc = max((d for m, d in depths.items() if m in nodes), default=0)
+        if best_ecc is None or ecc < best_ecc:
+            best_ecc, centre = ecc, [n]
+        elif ecc == best_ecc:
+            centre.append(n)
+    return centre
+
+
+TIER_H = 280.0        # vertical distance between tiers
+UNIT_W = NODE_W + 90  # horizontal slot per switch
+
+
+def _layout_tiered(topo: Topology,
+                   vsx_pairs: list[tuple[str, str]] | None = None,
+                   core_hints: list[str] | None = None
+                   ) -> dict[str, tuple[float, float]]:
+    """Hierarchical rows: core on top (graph centre or --core hints),
+    each further tier one BFS hop down, endpoints under their switch.
+    Rows use barycentric ordering to reduce crossings; VSX pairs are
+    kept adjacent as single units."""
+    pos: dict[str, tuple[float, float]] = {}
+    adj = _switch_adjacency(topo)
+    switches = list(adj.keys())
+    if not switches:
+        return _layout_circle(topo, vsx_pairs)
+
+    pair_of: dict[str, str] = {}
+    for a, b in (vsx_pairs or []):
+        pair_of[a] = b
+        pair_of[b] = a
+
+    hints = set()
+    for h in (core_hints or []):
+        hl = h.lower()
+        for dev in topo.devices.values():
+            if dev.is_switch and hl in ((dev.hostname or "").lower(),
+                                        dev.mgmt_ip, dev.key):
+                hints.add(dev.key)
+
+    # Components laid out side by side.
+    unvisited = set(switches)
+    comp_x0 = 200.0
+    top_y = 150.0
+    while unvisited:
+        seed = sorted(unvisited)[0]
+        comp = set(_bfs_depths(adj, [seed]))
+        comp &= unvisited
+        unvisited -= comp
+        comp_nodes = sorted(comp)
+
+        roots = sorted(hints & comp) or _graph_centre(adj, comp_nodes)
+        # A VSX partner of any root is core too, whatever BFS says.
+        roots = sorted(set(roots) | {pair_of[r] for r in roots
+                                     if pair_of.get(r) in comp})
+        depths = _bfs_depths(adj, roots)
+        # Unreached members (shouldn't happen within a component) -> deepest
+        maxd = max((depths.get(n, 0) for n in comp_nodes), default=0)
+        tiers: dict[int, list[str]] = {}
+        for n in comp_nodes:
+            tiers.setdefault(depths.get(n, maxd + 1), []).append(n)
+
+        # Collapse VSX pairs into units per tier.
+        def units_of(row: list[str]) -> list[list[str]]:
+            units, used = [], set()
+            for n in sorted(row, key=lambda k: (topo.devices[k].hostname
+                                                or k)):
+                if n in used:
+                    continue
+                p = pair_of.get(n)
+                if p in row and p not in used:
+                    units.append(sorted([n, p]))
+                    used.update((n, p))
+                else:
+                    units.append([n])
+                    used.add(n)
+            return units
+
+        unit_rows = {t: units_of(row) for t, row in tiers.items()}
+
+        # Barycentric ordering: place units under the mean slot of their
+        # neighbours in the tier above; two top-down passes suffice here.
+        slot: dict[str, float] = {}
+        for t in sorted(unit_rows):
+            for i, unit in enumerate(unit_rows[t]):
+                for n in unit:
+                    slot[n] = float(i)
+        for _ in range(2):
+            for t in sorted(unit_rows):
+                if t == min(unit_rows):
+                    continue
+                def bary(unit):
+                    ups = [slot[m] for n in unit for m in adj[n]
+                           if depths.get(m, 99) == t - 1]
+                    return (sum(ups) / len(ups)) if ups else 1e9
+                unit_rows[t].sort(key=bary)
+                for i, unit in enumerate(unit_rows[t]):
+                    for n in unit:
+                        slot[n] = float(i)
+
+        # Assign coordinates, rows centred on the widest row.
+        widths = {t: sum(2 if len(u) == 2 else 1 for u in unit_rows[t])
+                  for t in unit_rows}
+        max_w = max(widths.values())
+        for t in sorted(unit_rows):
+            x = comp_x0 + (max_w - widths[t]) * UNIT_W / 2
+            y = top_y + t * TIER_H
+            for unit in unit_rows[t]:
+                if len(unit) == 2:
+                    pos[unit[0]] = (x + UNIT_W * 0.5, y)
+                    pos[unit[1]] = (x + UNIT_W * 1.5, y)
+                    x += 2 * UNIT_W
+                else:
+                    pos[unit[0]] = (x + UNIT_W / 2, y)
+                    x += UNIT_W
+        comp_x0 += (max_w + 1.5) * UNIT_W
+
+    # Endpoints: fanned directly below their attached switch.
+    per_switch: dict[str, int] = {}
+    for e in topo.edges.values():
+        for k, other in ((e.a_key, e.b_key), (e.b_key, e.a_key)):
+            if k in pos or k in adj:
+                continue
+            if other in pos:
+                j = per_switch.get(other, 0)
+                per_switch[other] = j + 1
+                sx, sy = pos[other]
+                pos[k] = (sx + (j - 1) * (NODE_W * 0.55) * (1 if j % 2 else -1),
+                          sy + TIER_H * 0.65 + (j % 2) * 55)
+    # Stray devices with no placed neighbour.
+    stray = [d.key for d in topo.devices.values() if d.key not in pos]
+    for j, key in enumerate(stray):
+        pos[key] = (200 + j * (NODE_W + 40),
+                    top_y + (max((0,)) + 8) * TIER_H)
+    return pos
+
+
 def _layout(topo: Topology,
+            vsx_pairs: list[tuple[str, str]] | None = None,
+            mode: str = "tiered",
+            core_hints: list[str] | None = None
+            ) -> dict[str, tuple[float, float]]:
+    if mode == "circle":
+        return _layout_circle(topo, vsx_pairs)
+    return _layout_tiered(topo, vsx_pairs, core_hints)
+
+
+def _layout_circle(topo: Topology,
             vsx_pairs: list[tuple[str, str]] | None = None
             ) -> dict[str, tuple[float, float]]:
     """Switches on a circle; VSX pair members share a slot side by side;
@@ -1328,7 +1503,9 @@ def to_drawio_xml(topo: Topology,
                   l3_segments: list[L3Segment] | None = None,
                   routing_adjs: list[RoutingAdj] | None = None,
                   vsx_pairs: list[tuple[str, str]] | None = None,
-                  layered: bool = False) -> str:
+                  layered: bool = False,
+                  layout: str = "tiered",
+                  core_hints: list[str] | None = None) -> str:
     """Emit a draw.io file with one view per PAGE (default) or as
     toggleable layers on a single page (layered=True).
 
@@ -1338,7 +1515,7 @@ def to_drawio_xml(topo: Topology,
     overlays all views on one page (with per-layer edge bowing) for
     side-by-side comparison, at the cost of visual density.
     """
-    pos = _layout(topo, vsx_pairs)
+    pos = _layout(topo, vsx_pairs, layout, core_hints)
 
     if layered:
         xb = _XmlBuilder()
@@ -1497,6 +1674,14 @@ def main(argv: list[str] | None = None) -> int:
                       help="include subnets attached to only one switch "
                            "(SVIs, uplink /30s) as leaf nodes on the L3 "
                            "page — needed for single-switch/stack estates")
+    scan.add_argument("--layout", choices=["tiered", "circle"],
+                      default="tiered",
+                      help="tiered (core top, hierarchy below; default) "
+                           "or the original circle")
+    scan.add_argument("--core", action="append", default=[],
+                      metavar="HOST",
+                      help="pin a switch (hostname or IP) to the top tier; "
+                           "repeatable — overrides auto core detection")
     scan.add_argument("--layered", action="store_true",
                       help="single page with toggleable layers instead of "
                            "one page per view")
@@ -1658,7 +1843,8 @@ def run_scan(args) -> int:
     with open(args.output, "w") as f:
         f.write(to_drawio_xml(topo, l2_edges, l3_segments,
                               routing_adjs, vsx_pairs,
-                              layered=args.layered))
+                              layered=args.layered,
+                              layout=args.layout, core_hints=args.core))
     log.info("draw.io diagram written to %s (%s)", args.output,
          "layers: View > Layers" if args.layered
          else "one page per view — tabs at the bottom")

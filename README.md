@@ -176,9 +176,17 @@ after the login fails — harmless, but expect log noise on busy subnets,
 and be mindful of what a failed login means on devices with lockout
 policies.
 
-**Layout.** The circular layout is a starting point. For larger
-estates, draw.io's Arrange → Layout (e.g. organic or tree) will usually
-produce something better; port labels and layers survive re-layout.
+**Layout.** The default tiered layout infers the hierarchy from the
+topology itself: the graph centre (minimum eccentricity, which in a
+hierarchical network is the core — VSX pairs included) forms the top
+row, and every further tier is one hop down, so a 3-tier campus renders
+as core / aggregation / access rows with endpoints hanging below their
+switch. Rows are barycentre-ordered to keep access switches under
+their own aggregation and minimise crossing links. If auto-detection
+picks the wrong core on an unusual topology, pin it with `--core
+<hostname-or-IP>` (repeatable); `--layout circle` restores the original
+radial layout. Port labels and pages survive manual re-arrangement in
+draw.io.
 
 ## Tests
 
