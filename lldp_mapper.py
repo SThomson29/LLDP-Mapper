@@ -517,38 +517,45 @@ class AosCxRest:
                       self.host, type(exc).__name__)
         return result
 
-    def _collect_active_gateways(self, result: dict) -> None:
-        svis = [n for n, p in result.items() if p.is_svi]
-        if not svis:
-            return
-        found = 0
-        try:
-            data = self.get("/system/interfaces/*",
-                            params={"attributes": "vsx_virtual_ip4",
-                                    "depth": 2})
-            for k, v in (data or {}).items():
-                name = urllib.parse.unquote(k)
-                if name in result and isinstance(v, dict):
-                    vip = self._parse_vip(v.get("vsx_virtual_ip4"))
-                    if vip:
-                        result[name].active_gateway = vip
-                        found += 1
-        except requests.HTTPError:
-            for name in svis:
-                enc = urllib.parse.quote(name, safe="")
-                try:
-                    v = self.get(f"/system/interfaces/{enc}",
-                                 params={"attributes": "vsx_virtual_ip4",
-                                         "depth": 1})
-                except requests.HTTPError:
-                    return          # attribute unsupported: all N/A
-                vip = self._parse_vip((v or {}).get("vsx_virtual_ip4"))
-                if vip:
-                    result[name].active_gateway = vip
-                    found += 1
-        if found:
-            log.debug("%s: %d active-gateway VIP(s) collected",
-                      self.host, found)
+def _collect_active_gateways(self, result: dict) -> None:
+    svis = [n for n, p in result.items() if p.is_svi]
+    if not svis:
+        return
+
+    rows, found = {}, 0
+    attrs = "name,vsx_virtual_ip4,vsx_virtual_gw_mac_v4"
+
+    try:
+        data = self.get("/system/interfaces",
+                        params={"attributes": attrs, "depth": 2})
+        for k, v in (data or {}).items():
+            if isinstance(v, dict):
+                name = v.get("name") or urllib.parse.unquote(k.rsplit("/", 1)[-1])
+                rows[name] = v
+    except requests.HTTPError as e:
+        log.debug("%s: bulk active-gateway query failed (%s)", self.host, e)
+
+    if not rows:
+        for name in svis:
+            enc = urllib.parse.quote(name, safe="")
+            try:
+                v = self.get(f"/system/interfaces/{enc}",
+                             params={"attributes": attrs, "depth": 1})
+            except requests.HTTPError as e:
+                log.debug("%s: %s AG query failed: %s", self.host, name, e)
+                continue
+            if isinstance(v, dict):
+                rows[name] = v
+
+    for name in svis:
+        v = rows.get(name)
+        if not isinstance(v, dict):
+            continue
+        if vip := self._parse_vip(v.get("vsx_virtual_ip4")):
+            result[name].active_gateway = vip
+            found += 1
+
+    log.debug("%s: %d/%d SVI active-gateway VIP(s)", self.host, found, len(svis))
 
     def _interface_details_raw(self) -> dict[str, PortInfo]:
         try:
