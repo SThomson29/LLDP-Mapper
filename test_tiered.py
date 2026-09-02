@@ -105,3 +105,55 @@ pos3 = _layout(topo3, [(K3["core-01"], K3["core-02"])])
 assert pos3[K3["core-01"]][1] < pos3[K3["acc-01"]][1]
 assert len({round(pos3[K3[n]][1]) for n in K3}) == 2
 print("collapsed-core 2-tier OK")
+
+# ---------------------------------------------------------------------------
+# REGRESSIONS: row ordering (see git history — these both failed before the
+# primary-parent / hostname-order fix)
+# ---------------------------------------------------------------------------
+def _build(names, macs, links, pairs):
+    topo, K = Topology(), {}
+    for n in names:
+        K[n] = macs[n]
+        topo.upsert_device(Device(key=K[n], hostname=n, is_switch=True))
+    for a, pa, b, pb in links:
+        topo.add_edge(Edge(a_key=K[a], a_port=pa, b_key=K[b], b_port=pb))
+    return K, _layout(topo, [(K[x], K[y]) for x, y in pairs])
+
+# --- REGRESSION: VSX member order must follow hostname, not chassis MAC ------
+# core-01 is deliberately given the HIGHER chassis MAC. Real chassis MACs
+# bear no relation to hostnames, so a fixture numbered in hostname order
+# cannot catch this.
+names = ["core-01", "core-02", "acc-01", "acc-02"]
+macs = {"core-01": "bb:00:00:00:00:01",   # higher MAC, lower hostname
+        "core-02": "aa:00:00:00:00:02",
+        "acc-01": "cc:00:00:00:00:01",
+        "acc-02": "cc:00:00:00:00:02"}
+links = [("core-01", "1/1/49", "core-02", "1/1/49"),
+         ("core-01", "1/1/1", "acc-01", "1/1/51"),
+         ("core-02", "1/1/1", "acc-01", "1/1/52"),
+         ("core-01", "1/1/2", "acc-02", "1/1/51"),
+         ("core-02", "1/1/2", "acc-02", "1/1/52")]
+K, pos = _build(names, macs, links, [("core-01", "core-02")])
+assert pos[K["core-01"]][0] < pos[K["core-02"]][0], \
+    ("VSX members ordered by MAC, not hostname",
+     pos[K["core-01"]][0], pos[K["core-02"]][0])
+print("VSX member order OK (-01 left of -02 regardless of chassis MAC)")
+
+# --- REGRESSION: a child homed only to the SECONDARY must not be ranked
+# --- against the primary's port numbers.
+names = ["core-01", "core-02", "acc-01", "acc-02", "acc-03", "acc-04"]
+macs = {n: "dd:00:00:00:00:0%d" % i for i, n in enumerate(names)}
+links = [("core-01", "1/1/49", "core-02", "1/1/49"),
+         ("core-01", "1/1/1", "acc-01", "1/1/51"),
+         ("core-02", "1/1/11", "acc-01", "1/1/52"),
+         ("core-01", "1/1/2", "acc-02", "1/1/51"),
+         ("core-02", "1/1/12", "acc-02", "1/1/52"),
+         ("core-01", "1/1/3", "acc-03", "1/1/51"),
+         ("core-02", "1/1/13", "acc-03", "1/1/52"),
+         # acc-04 single-homed to the SECONDARY, low port number
+         ("core-02", "1/1/1", "acc-04", "1/1/51")]
+K, pos = _build(names, macs, links, [("core-01", "core-02")])
+order = sorted(["acc-01", "acc-02", "acc-03", "acc-04"],
+               key=lambda n: pos[K[n]][0])
+assert order == ["acc-01", "acc-02", "acc-03", "acc-04"], order
+print("secondary-only child OK (sorts after primary-homed, not by its port)")

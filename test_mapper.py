@@ -133,6 +133,6 @@ for c in end_labels:
     assert float(g.get("x")) in (-0.75, 0.75)
 print("draw.io XML OK (parsed, all edges reference valid nodes)")
 
-with open("/home/claude/lldp-mapper/sample_topology.drawio", "w") as f:
+with open("sample_topology.drawio", "w") as f:
     f.write(xml)
 print("sample written")
