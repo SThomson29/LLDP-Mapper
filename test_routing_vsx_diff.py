@@ -193,3 +193,25 @@ v2 = _FakeVsx({"role": "secondary"}).vsx_info()   # legacy fallback
 assert v2 and v2.role == "secondary"
 assert _FakeVsx({"system_mac": "02:01:00:00:01:00"}).vsx_info() is None
 print("VSX device_role schema OK (primary attr, legacy fallback, non-VSX None)")
+
+# a non-FULL neighbour inside an OSPF hub stays visible as its own edge
+from lldp_mapper import RoutingAdj as _RA, Topology as _Tp, Device as _Dv
+from lldp_mapper import _XmlBuilder, _render_routing
+ht = _Tp()
+for k in "abc":
+    ht.upsert_device(_Dv(key=k, hostname=f"sw-{k}", is_switch=True))
+hpos = {"a": (0, 0), "b": (300, 0), "c": (150, 300)}
+hadjs = [_RA("ospf", "default", "a", "b", detail="area 0.0.0.0", state="FULL"),
+         _RA("ospf", "default", "b", "c", detail="area 0.0.0.0", state="FULL"),
+         _RA("ospf", "default", "a", "c", detail="area 0.0.0.0",
+             state="EXSTART")]
+hxb = _XmlBuilder(); _render_routing(hxb, "1", ht, hpos, hadjs)
+hx = "\n".join(hxb.cells)
+assert hx.count("EXSTART") == 1 and "FULL" not in hx, hx
+print("routing hub OK (unhealthy adjacency drawn explicitly)")
+
+# device-supplied markup is neutralised in html=1 labels
+exb = _XmlBuilder(); exb.node("1", "<b>ap</b> & co\nline2", "html=1;", 0, 0)
+ev = ET.fromstring(exb.cells[0]).get("value")
+assert ev == "&lt;b&gt;ap&lt;/b&gt; &amp; co\nline2", ev
+print("label escaping OK")

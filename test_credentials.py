@@ -113,3 +113,58 @@ deduped = dedupe_polled(polled)
 assert len(deduped) == 2
 assert [p.device.mgmt_ip for p in deduped] == ["10.1.0.1", "10.1.0.2"]
 print("multi-subnet dedupe OK (duplicate switch dropped, first IP kept)")
+
+# --- non-AOS-CX hosts never receive credentials ------------------------------
+from lldp_mapper import AosCxRest, NotAosCxError
+
+class _R:
+    def __init__(self, code, body): self.status_code, self._b = code, body
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            e = requests.HTTPError(str(self.status_code)); e.response = self
+            raise e
+    def json(self):
+        if self._b is None:
+            raise ValueError("not json")
+        return self._b
+
+class _Sess:
+    def __init__(self, resp): self.resp, self.posts, self.verify = resp, [], False
+    def get(self, url, **kw): return self.resp
+    def post(self, url, **kw):
+        self.posts.append(url); return _R(200, {})
+    def close(self): pass
+
+for resp in (_R(404, None), _R(200, None), _R(200, {"hello": 1}),
+             _R(200, ["x"])):
+    api = AosCxRest("10.9.9.9", "u", "p")
+    api.session = _Sess(resp)
+    try:
+        api.__enter__()
+        raise AssertionError("login attempted against a non-CX host")
+    except NotAosCxError:
+        pass
+    assert api.session.posts == [], api.session.posts
+
+api = AosCxRest("10.9.9.9", "u", "p")
+api.session = _Sess(_R(200, {"latest": {"version": "v10.13"}, "v10.04": {}}))
+api.__enter__()
+assert api.session.posts == ["https://10.9.9.9/rest/v10.13/login"]
+# a pinned version skips the fingerprint by design
+api = AosCxRest("10.9.9.9", "u", "p", api_version="v10.04")
+api.session = _Sess(_R(404, None))
+api.__enter__()
+assert api.session.posts == ["https://10.9.9.9/rest/v10.04/login"]
+
+real = lldp_mapper.AosCxRest
+class _NotCx:
+    def __init__(self, *a, **k): pass
+    def __enter__(self): raise NotAosCxError("/rest returned HTTP 404")
+    def __exit__(self, *e): pass
+lldp_mapper.AosCxRest = _NotCx
+try:
+    assert poll_device("10.9.9.9", [("u", "p"), ("u2", "p2")],
+                       "auto", False) is None
+finally:
+    lldp_mapper.AosCxRest = real
+print("AOS-CX fingerprint OK (no login without a /rest index; pin bypasses)")

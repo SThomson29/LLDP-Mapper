@@ -111,3 +111,12 @@ assert len(l3_wp) >= 1
 # L2 and L3 bow to opposite sides of the same link where both exist
 assert "curved=1" in edges_of("lyr_l2")[0].get("style", "")
 print("layer overlay bowing OK (phys straight, L2/L3 curved with waypoints)")
+
+# trunk with an empty allowed list = all VLANs on AOS-CX
+from lldp_mapper import _vlan_label
+assert _vlan_label(PortInfo(name="1/1/1", vlan_mode="native-untagged",
+                            native_vlan=1)) == "trunk all · native 1"
+assert _vlan_label(PortInfo(name="1/1/2", vlan_mode="access",
+                            access_vlan=20)) == "access 20"
+assert _vlan_label(PortInfo(name="1/1/3")) == ""
+print("trunk-all label OK")

@@ -7,12 +7,14 @@ neighbour data via the AOS-CX REST API, builds a deduplicated topology
 graph, and emits a draw.io XML diagram.
 
 Usage:
-    python3 lldp_mapper.py 10.20.30.0/24 -u admin -o topology.drawio
-    python3 lldp_mapper.py 10.20.30.0/24 -u admin --include-endpoints
-    python3 lldp_mapper.py 10.20.30.0/24 -u admin --json inventory.json
+    python3 lldp_mapper.py scan 10.20.30.0/24 -u admin -o topology.drawio
+    python3 lldp_mapper.py scan 10.20.30.0/24 --creds creds.json
+    python3 lldp_mapper.py scan 10.20.30.0/24 -u admin --include-endpoints
+    python3 lldp_mapper.py diff old.json new.json -o diff.drawio
 
-Credentials: password is taken from the AOSCX_PASSWORD environment
-variable if set, otherwise prompted interactively (never on the CLI).
+Credentials: --creds JSON file and/or -u accounts. With a single -u the
+password is taken from the AOSCX_PASSWORD environment variable if set,
+otherwise prompted interactively (never on the CLI).
 
 Only stdlib + requests. Designed for AOS-CX 10.04+.
 """
@@ -242,6 +244,10 @@ class PollResult:
 # AOS-CX REST client
 # --------------------------------------------------------------------------
 
+class NotAosCxError(Exception):
+    """Host has no recognisable AOS-CX REST index; no login attempted."""
+
+
 class AosCxRest:
     """Minimal AOS-CX REST session with guaranteed logout.
 
@@ -284,33 +290,54 @@ class AosCxRest:
     def _negotiate_version(self) -> str:
         """GET /rest (unauthenticated) and pick the latest version.
 
-        Falls back to v10.04 if the index is unreachable or unparsable —
-        that version is published by all 10.04+ firmware and shares the
-        newest schema on modern releases.
+        The index doubles as the AOS-CX fingerprint: a host that does
+        not serve one (iLO, printer, firewall, ...) raises NotAosCxError
+        so no credentials are ever posted to it. Pin --api-version to
+        bypass the check for a switch whose index is unavailable.
         """
         try:
             r = self.session.get(f"https://{self.host}/rest",
                                  timeout=HTTP_TIMEOUT)
             r.raise_for_status()
-            version = self.pick_version(r.json() or {})
-        except (requests.RequestException, ValueError):
-            log.debug("%s: /rest version index unavailable, using %s",
-                      self.host, FALLBACK_API_VERSION)
-            return FALLBACK_API_VERSION
+            index = r.json()
+        except ValueError as exc:      # 200 but not JSON (some web UI)
+            raise NotAosCxError("/rest is not a JSON index") from exc
+        except requests.HTTPError as exc:
+            code = (exc.response.status_code
+                    if exc.response is not None else "?")
+            raise NotAosCxError(f"/rest returned HTTP {code}") from exc
+        if not self.looks_like_index(index):
+            raise NotAosCxError("/rest lists no API versions")
+        version = self.pick_version(index)
         log.debug("%s: negotiated API version %s", self.host, version)
         return version
 
+    @staticmethod
+    def looks_like_index(index) -> bool:
+        """True if a GET /rest body advertises at least one vX.Y."""
+        if not isinstance(index, dict):
+            return False
+        latest = index.get("latest")
+        if isinstance(latest, dict) and re.fullmatch(
+                r"v\d+\.\d+", str(latest.get("version") or "")):
+            return True
+        return any(re.fullmatch(r"v\d+\.\d+", str(k)) for k in index)
+
     def __enter__(self) -> "AosCxRest":
-        version = (self._negotiate_version()
-                   if self.api_version == "auto" else self.api_version)
-        self.api_version = version
-        self.base = f"https://{self.host}/rest/{version}"
-        r = self.session.post(
-            f"{self.base}/login",
-            data={"username": self.username, "password": self.password},
-            timeout=HTTP_TIMEOUT,
-        )
-        r.raise_for_status()
+        try:
+            version = (self._negotiate_version()
+                       if self.api_version == "auto" else self.api_version)
+            self.api_version = version
+            self.base = f"https://{self.host}/rest/{version}"
+            r = self.session.post(
+                f"{self.base}/login",
+                data={"username": self.username, "password": self.password},
+                timeout=HTTP_TIMEOUT,
+            )
+            r.raise_for_status()
+        except BaseException:
+            self.session.close()     # __exit__ is not called on failure
+            raise
         self._logged_in = True
         return self
 
@@ -350,9 +377,9 @@ class AosCxRest:
             data = self.get("/system/interfaces/*/lldp_neighbors",
                             params={"depth": 2})
             return self._parse_wildcard(data)
-        except requests.HTTPError:
-            log.debug("%s: wildcard LLDP query unsupported, iterating",
-                      self.host)
+        except (requests.HTTPError, requests.Timeout) as exc:
+            log.debug("%s: wildcard LLDP query failed (%s), iterating",
+                      self.host, type(exc).__name__)
         result: dict[str, list[dict]] = {}
         for ifname in self.interface_names():
             enc = urllib.parse.quote(ifname, safe="")
@@ -517,45 +544,49 @@ class AosCxRest:
                       self.host, type(exc).__name__)
         return result
 
-def _collect_active_gateways(self, result: dict) -> None:
-    svis = [n for n, p in result.items() if p.is_svi]
-    if not svis:
-        return
+    def _collect_active_gateways(self, result: dict) -> None:
+        svis = [n for n, p in result.items() if p.is_svi]
+        if not svis:
+            return
 
-    rows, found = {}, 0
-    attrs = "name,vsx_virtual_ip4,vsx_virtual_gw_mac_v4"
+        rows, found = {}, 0
+        attrs = "name,vsx_virtual_ip4"
 
-    try:
-        data = self.get("/system/interfaces",
-                        params={"attributes": attrs, "depth": 2})
-        for k, v in (data or {}).items():
-            if isinstance(v, dict):
-                name = v.get("name") or urllib.parse.unquote(k.rsplit("/", 1)[-1])
-                rows[name] = v
-    except requests.HTTPError as e:
-        log.debug("%s: bulk active-gateway query failed (%s)", self.host, e)
+        try:
+            data = self.get("/system/interfaces",
+                            params={"attributes": attrs, "depth": 2})
+            for k, v in (data or {}).items():
+                if isinstance(v, dict):
+                    name = v.get("name") or urllib.parse.unquote(k.rsplit("/", 1)[-1])
+                    rows[name] = v
+        except requests.HTTPError as e:
+            log.debug("%s: bulk active-gateway query failed (%s)", self.host, e)
 
-    if not rows:
+        if not rows:
+            for name in svis:
+                enc = urllib.parse.quote(name, safe="")
+                try:
+                    v = self.get(f"/system/interfaces/{enc}",
+                                 params={"attributes": attrs, "depth": 1})
+                except requests.HTTPError as e:
+                    log.debug("%s: %s AG query failed: %s", self.host, name, e)
+                    if not rows:
+                        # First per-SVI query rejected too: the attribute
+                        # is unsupported here, so don't hammer every SVI.
+                        return
+                    continue
+                if isinstance(v, dict):
+                    rows[name] = v
+
         for name in svis:
-            enc = urllib.parse.quote(name, safe="")
-            try:
-                v = self.get(f"/system/interfaces/{enc}",
-                             params={"attributes": attrs, "depth": 1})
-            except requests.HTTPError as e:
-                log.debug("%s: %s AG query failed: %s", self.host, name, e)
+            v = rows.get(name)
+            if not isinstance(v, dict):
                 continue
-            if isinstance(v, dict):
-                rows[name] = v
+            if vip := self._parse_vip(v.get("vsx_virtual_ip4")):
+                result[name].active_gateway = vip
+                found += 1
 
-    for name in svis:
-        v = rows.get(name)
-        if not isinstance(v, dict):
-            continue
-        if vip := self._parse_vip(v.get("vsx_virtual_ip4")):
-            result[name].active_gateway = vip
-            found += 1
-
-    log.debug("%s: %d/%d SVI active-gateway VIP(s)", self.host, found, len(svis))
+        log.debug("%s: %d/%d SVI active-gateway VIP(s)", self.host, found, len(svis))
 
     def _interface_details_raw(self) -> dict[str, PortInfo]:
         try:
@@ -565,9 +596,9 @@ def _collect_active_gateways(self, result: dict) -> None:
             return {urllib.parse.unquote(k): self._parse_port(
                         urllib.parse.unquote(k), v)
                     for k, v in (data or {}).items() if isinstance(v, dict)}
-        except requests.HTTPError:
-            log.debug("%s: wildcard interface query unsupported, iterating",
-                      self.host)
+        except (requests.HTTPError, requests.Timeout) as exc:
+            log.debug("%s: wildcard interface query failed (%s), iterating",
+                      self.host, type(exc).__name__)
         result: dict[str, PortInfo] = {}
         for ifname in self.interface_names():
             enc = urllib.parse.quote(ifname, safe="")
@@ -699,6 +730,10 @@ def poll_device(ip: str, credentials: list[tuple[str, str]],
                 if want_routing:
                     ospf = api.ospf_neighbors()
                     bgp = api.bgp_neighbors()
+        except NotAosCxError as exc:
+            log.warning("%s: not AOS-CX (%s) — skipping, no login "
+                        "attempted (pin --api-version to force)", ip, exc)
+            return None
         except requests.HTTPError as exc:
             code = (exc.response.status_code
                     if exc.response is not None else 0)
@@ -802,6 +837,9 @@ def _vlan_label(p: PortInfo | None) -> str:
     parts = []
     if p.trunk_vlans:
         parts.append(f"trunk {compress_vlans(p.trunk_vlans)}")
+    elif p.vlan_mode.startswith("native"):
+        # AOS-CX: an empty vlan_trunks on a trunk port means "allowed all".
+        parts.append("trunk all")
     if p.native_vlan is not None:
         parts.append(f"native {p.native_vlan}")
     return " · ".join(parts)
@@ -1140,6 +1178,27 @@ def _graph_centre(adj: dict[str, set[str]], nodes: list[str]) -> list[str]:
     return sorted(nodes)  # unreachable, defensive
 
 
+def _pair_map(vsx_pairs: list[tuple[str, str]] | None) -> dict[str, str]:
+    pair_of: dict[str, str] = {}
+    for a, b in (vsx_pairs or []):
+        pair_of[a] = b
+        pair_of[b] = a
+    return pair_of
+
+
+def _resolve_core_hints(topo: Topology,
+                        core_hints: list[str] | None) -> set[str]:
+    """Map --core values (hostname, mgmt IP or device key) to keys."""
+    hints: set[str] = set()
+    for h in (core_hints or []):
+        hl = h.lower()
+        for dev in topo.devices.values():
+            if dev.is_switch and hl in ((dev.hostname or "").lower(),
+                                        dev.mgmt_ip, dev.key):
+                hints.add(dev.key)
+    return hints
+
+
 @dataclass
 class ScopeInfo:
     tier: dict[str, int] = field(default_factory=dict)      # key -> depth
@@ -1166,17 +1225,8 @@ def classify_scopes(topo: Topology,
     adj = _switch_adjacency(topo)
     if not adj:
         return info
-    pair_of: dict[str, str] = {}
-    for a, b in (vsx_pairs or []):
-        pair_of[a] = b
-        pair_of[b] = a
-    hints = set()
-    for h in (core_hints or []):
-        hl = h.lower()
-        for dev in topo.devices.values():
-            if dev.is_switch and hl in ((dev.hostname or "").lower(),
-                                        dev.mgmt_ip, dev.key):
-                hints.add(dev.key)
+    pair_of = _pair_map(vsx_pairs)
+    hints = _resolve_core_hints(topo, core_hints)
     nodes = sorted(adj)
     roots = sorted(hints & set(nodes)) or _graph_centre(adj, nodes)
     roots = sorted(set(roots) | {pair_of[r] for r in roots
@@ -1223,6 +1273,33 @@ def _port_sort_key(port: str) -> tuple:
 
 TIER_H = 280.0        # vertical distance between tiers
 UNIT_W = NODE_W + 90  # horizontal slot per switch
+EP_COLS = 4           # endpoints per row in the grid under a switch
+EP_W = NODE_W + 20    # horizontal slot per endpoint
+EP_ROW_H = NODE_H + 20
+EP_Y0 = 150.0         # switch centre -> first endpoint row centre
+
+
+def _endpoints_by_switch(topo: Topology, adj: dict[str, set[str]]
+                         ) -> dict[str, list[str]]:
+    """{switch_key: [endpoint keys]} ordered by the switch-side port.
+
+    An endpoint seen by several switches (dual-homed server on a VSX
+    pair) is drawn under the first by hostname.
+    """
+    seen: dict[str, tuple] = {}
+    for e in topo.edges.values():
+        for ep, sw, port in ((e.a_key, e.b_key, e.b_port),
+                             (e.b_key, e.a_key, e.a_port)):
+            if ep in adj or sw not in adj or ep not in topo.devices:
+                continue
+            cand = (topo.devices[sw].hostname or sw, sw,
+                    _port_sort_key(port), ep)
+            if ep not in seen or cand < seen[ep]:
+                seen[ep] = cand
+    out: dict[str, list[str]] = {}
+    for _, sw, _, ep in sorted(seen.values()):
+        out.setdefault(sw, []).append(ep)
+    return out
 
 
 def _layout_tiered(topo: Topology,
@@ -1230,27 +1307,26 @@ def _layout_tiered(topo: Topology,
                    core_hints: list[str] | None = None
                    ) -> dict[str, tuple[float, float]]:
     """Hierarchical rows: core on top (graph centre or --core hints),
-    each further tier one BFS hop down, endpoints under their switch.
-    Rows use barycentric ordering to reduce crossings; VSX pairs are
-    kept adjacent as single units."""
+    each further tier one BFS hop down. VSX pairs are kept adjacent as
+    single units. Endpoints sit in a grid under their switch; the
+    switch's slot widens and the gap to the next tier deepens to make
+    room, so endpoints never overlap neighbours or the tier below."""
     pos: dict[str, tuple[float, float]] = {}
     adj = _switch_adjacency(topo)
     switches = list(adj.keys())
     if not switches:
         return _layout_circle(topo, vsx_pairs)
 
-    pair_of: dict[str, str] = {}
-    for a, b in (vsx_pairs or []):
-        pair_of[a] = b
-        pair_of[b] = a
+    pair_of = _pair_map(vsx_pairs)
+    hints = _resolve_core_hints(topo, core_hints)
+    eps_of = _endpoints_by_switch(topo, adj)
 
-    hints = set()
-    for h in (core_hints or []):
-        hl = h.lower()
-        for dev in topo.devices.values():
-            if dev.is_switch and hl in ((dev.hostname or "").lower(),
-                                        dev.mgmt_ip, dev.key):
-                hints.add(dev.key)
+    def slot_w(n: str) -> float:
+        cols = min(len(eps_of.get(n, ())), EP_COLS)
+        return max(UNIT_W, cols * EP_W + 30)
+
+    def ep_rows(n: str) -> int:
+        return math.ceil(len(eps_of.get(n, ())) / EP_COLS)
 
     # Components laid out side by side.
     unvisited = set(switches)
@@ -1267,9 +1343,16 @@ def _layout_tiered(topo: Topology,
         # A VSX partner of any root is core too, whatever detection says.
         roots = sorted(set(roots) | {pair_of[r] for r in roots
                                      if pair_of.get(r) in comp})
+        if hints & comp:
+            note = ""
+        elif len(roots) > 2:
+            note = (" (auto-detected, but %d switches tied — pin the real "
+                    "core with --core)" % len(roots))
+        else:
+            note = " (auto-detected; override with --core)"
         log.info("tiered layout: core tier = %s%s",
                  ", ".join(topo.devices[r].hostname or r for r in roots),
-                 "" if hints else " (auto-detected; override with --core)")
+                 note)
         depths = _bfs_depths(adj, roots)
         # Unreached members (shouldn't happen within a component) -> deepest
         maxd = max((depths.get(n, 0) for n in comp_nodes), default=0)
@@ -1360,7 +1443,7 @@ def _layout_tiered(topo: Topology,
         BLOCK_GAP = UNIT_W * 0.7
 
         def unit_w(u) -> float:
-            return (2 if len(u) == 2 else 1) * UNIT_W
+            return sum(slot_w(n) for n in u)
 
         # Deepest row: sequential, gap between blocks.
         centre: dict[int, list[float]] = {}
@@ -1415,34 +1498,33 @@ def _layout_tiered(topo: Topology,
         span = max(c + unit_w(u) / 2
                    for t in unit_rows
                    for c, u in zip(centre[t], unit_rows[t])) - min_x
+        y = top_y
         for t in sorted(unit_rows):
-            y = top_y + t * TIER_H
             for c, unit in zip(centre[t], unit_rows[t]):
-                cx = comp_x0 + (c - min_x)
-                if len(unit) == 2:
-                    pos[unit[0]] = (cx - UNIT_W / 2, y)
-                    pos[unit[1]] = (cx + UNIT_W / 2, y)
-                else:
-                    pos[unit[0]] = (cx, y)
+                x = comp_x0 + (c - min_x) - unit_w(unit) / 2
+                for n in unit:
+                    pos[n] = (x + slot_w(n) / 2, y)
+                    x += slot_w(n)
+            # Deepen the gap below a tier that carries endpoint rows.
+            rows = max((ep_rows(n) for u in unit_rows[t] for n in u),
+                       default=0)
+            y += max(TIER_H, EP_Y0 + rows * EP_ROW_H + 70) if rows else TIER_H
         comp_x0 += span + 1.5 * UNIT_W
 
-    # Endpoints: fanned directly below their attached switch.
-    per_switch: dict[str, int] = {}
-    for e in topo.edges.values():
-        for k, other in ((e.a_key, e.b_key), (e.b_key, e.a_key)):
-            if k in pos or k in adj:
-                continue
-            if other in pos:
-                j = per_switch.get(other, 0)
-                per_switch[other] = j + 1
-                sx, sy = pos[other]
-                pos[k] = (sx + (j - 1) * (NODE_W * 0.55) * (1 if j % 2 else -1),
-                          sy + TIER_H * 0.65 + (j % 2) * 55)
-    # Stray devices with no placed neighbour.
+    # Endpoints: a grid of up to EP_COLS columns under their switch,
+    # in switch-port order, each row centred on the switch.
+    for sw, eps in eps_of.items():
+        sx, sy = pos[sw]
+        for i, ep in enumerate(eps):
+            r, c = divmod(i, EP_COLS)
+            in_row = min(EP_COLS, len(eps) - r * EP_COLS)
+            pos[ep] = (sx + (c - (in_row - 1) / 2) * EP_W,
+                       sy + EP_Y0 + r * EP_ROW_H)
+    # Stray devices with no placed neighbour: one row under everything.
     stray = [d.key for d in topo.devices.values() if d.key not in pos]
+    stray_y = max((p[1] for p in pos.values()), default=top_y) + TIER_H
     for j, key in enumerate(stray):
-        pos[key] = (200 + j * (NODE_W + 40),
-                    top_y + (max((0,)) + 8) * TIER_H)
+        pos[key] = (200 + j * (NODE_W + 40), stray_y)
     return pos
 
 
@@ -1465,10 +1547,7 @@ def _layout_circle(topo: Topology,
     switches = [d for d in topo.devices.values() if d.is_switch]
     endpoints = [d for d in topo.devices.values() if not d.is_switch]
 
-    pair_of: dict[str, str] = {}
-    for a, b in (vsx_pairs or []):
-        pair_of[a] = b
-        pair_of[b] = a
+    pair_of = _pair_map(vsx_pairs)
 
     # Build circle slots: one per standalone switch, one per VSX pair.
     slots: list[list[str]] = []
@@ -1552,6 +1631,18 @@ VSX_BOX_STYLE = (
     "dashed=1;dashPattern=8 4;verticalAlign=top;fontSize=10;"
     "fontColor=#6c8ebf;fontFamily=Helvetica;"
 )
+ADJ_DOWN_EDGE_STYLE = (EDGE_STYLE + "strokeColor=#b85450;strokeWidth=2;"
+                       "dashed=1;curved=1;fontColor=#b85450;")
+# Adjacency states that are normal at rest; anything else (INIT,
+# EXSTART, Idle, Active, ...) is drawn explicitly even inside a hub.
+HEALTHY_ADJ_STATES = {"", "FULL", "TWO_WAY", "TWOWAY", "2WAY", "2-WAY",
+                      "ESTABLISHED"}
+
+
+def _adj_healthy(adj: RoutingAdj) -> bool:
+    return adj.state.upper().replace(" ", "_") in HEALTHY_ADJ_STATES
+
+
 DIFF_ADDED_NODE = SWITCH_STYLE.replace(
     "fillColor=#dae8fc;strokeColor=#6c8ebf",
     "fillColor=#d5e8d4;strokeColor=#82b366")
@@ -1573,9 +1664,16 @@ class _XmlBuilder:
     def _esc(label: str) -> str:
         # &#10; survives XML attribute-value normalisation; a literal
         # newline would be collapsed to a space by conformant parsers.
-        # Double quotes are escaped so HTML-table labels can't break
-        # out of the value attribute.
+        # Double quotes are escaped so a label can't break out of the
+        # value attribute.
         return escape(label, {"\n": "&#10;", '"': "&quot;"})
+
+    @classmethod
+    def _esc_html(cls, label: str) -> str:
+        # Cell labels render as HTML (html=1) and carry LLDP-supplied
+        # text any attached device can set, so neutralise markup first,
+        # then escape the result for the XML attribute.
+        return cls._esc(escape(label))
 
     def layer(self, layer_id: str, name: str, visible: bool) -> None:
         vis = "" if visible else ' visible="0"'
@@ -1588,7 +1686,7 @@ class _XmlBuilder:
         nid = f"n{self._next}"
         self._next += 1
         self.cells.append(
-            f'<mxCell id="{nid}" value="{self._esc(label)}" style="{style}" '
+            f'<mxCell id="{nid}" value="{self._esc_html(label)}" style="{style}" '
             f'vertex="1" parent="{layer}">'
             f'<mxGeometry x="{x - w / 2:.0f}" y="{y - h / 2:.0f}" '
             f'width="{w:.0f}" height="{h:.0f}" as="geometry"/></mxCell>')
@@ -1622,7 +1720,7 @@ class _XmlBuilder:
         if labels_as_tooltip and (src_label or dst_label):
             tip = f"{src_label} \u2194 {dst_label}".strip(" \u2194 ")
             self.cells.append(
-                f'<object label="{self._esc(label)}" '
+                f'<object label="{self._esc_html(label)}" '
                 f'tooltip="{self._esc(tip)}" id="{eid}">'
                 f'<mxCell style="{style}" edge="1" parent="{layer}" '
                 f'source="{src}" target="{dst}">'
@@ -1630,7 +1728,7 @@ class _XmlBuilder:
                 f'</mxCell></object>')
             return
         self.cells.append(
-            f'<mxCell id="{eid}" value="{self._esc(label)}" style="{style}" '
+            f'<mxCell id="{eid}" value="{self._esc_html(label)}" style="{style}" '
             f'edge="1" parent="{layer}" source="{src}" target="{dst}">'
             f'<mxGeometry relative="1" as="geometry">{wp}</mxGeometry>'
             f'</mxCell>')
@@ -1640,7 +1738,7 @@ class _XmlBuilder:
             lid = f"el{self._next}"
             self._next += 1
             self.cells.append(
-                f'<mxCell id="{lid}" value="{self._esc(text)}" '
+                f'<mxCell id="{lid}" value="{self._esc_html(text)}" '
                 f'style="edgeLabel;html=1;align=center;verticalAlign=middle;'
                 f'resizable=0;points=[];fontSize=9;fontColor=#333333;'
                 f'labelBackgroundColor=#ffffff;" '
@@ -1708,7 +1806,7 @@ def _render_l2(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
     l2_devs = {e.a_key for e in l2_edges} | {e.b_key for e in l2_edges}
     _vsx_boxes(xb, parent, pos, vsx_pairs, l2_devs)
     ids: dict[str, str] = {}
-    for key in l2_devs:
+    for key in sorted(l2_devs):
         dev = topo.devices.get(key)
         if dev is None:
             continue
@@ -1735,7 +1833,7 @@ def _render_l3(xb: "_XmlBuilder", parent: str, topo: Topology, pos: dict,
                bow_offset: float = 0.0, detail: bool = True) -> None:
     ids: dict[str, str] = {}
     l3_devs = {k for seg in l3_segments for k in seg.members}
-    for key in l3_devs:
+    for key in sorted(l3_devs):
         dev = topo.devices.get(key)
         if dev is None:
             continue
@@ -1781,7 +1879,7 @@ def _render_routing(xb: "_XmlBuilder", parent: str, topo: Topology,
     rt_devs = {a.a_key for a in routing_adjs} | {
         a.b_key for a in routing_adjs if a.b_key}
     ids: dict[str, str] = {}
-    for key in rt_devs:
+    for key in sorted(rt_devs):
         dev = topo.devices.get(key)
         if dev is None:
             continue
@@ -1798,23 +1896,25 @@ def _render_routing(xb: "_XmlBuilder", parent: str, topo: Topology,
     # render as a hub with one spoke per member instead of a pairwise
     # mesh (an N-member iBGP mesh is N spokes, not N*(N-1)/2 edges).
     HUB_MIN_MEMBERS = 3
-    domains: dict[tuple, set[str]] = {}
+    domains: dict[tuple, list[RoutingAdj]] = {}
     direct: list[RoutingAdj] = []
+    unhealthy: list[RoutingAdj] = []
     for adj in routing_adjs:
         if adj.b_key and (adj.protocol == "ospf"
                           or adj.detail.startswith("iBGP")):
             key = (adj.protocol, adj.vrf, adj.detail)
-            domains.setdefault(key, set()).update((adj.a_key, adj.b_key))
+            domains.setdefault(key, []).append(adj)
         else:
             direct.append(adj)
-    for (proto, vrf, det), members in sorted(domains.items()):
-        members = {m for m in members if m in ids}
+    for (proto, vrf, det), dom_adjs in sorted(domains.items()):
+        members = {m for a in dom_adjs for m in (a.a_key, a.b_key)
+                   if m in ids}
         if len(members) < HUB_MIN_MEMBERS:
-            direct.extend(a for a in routing_adjs
-                          if (a.protocol, a.vrf, a.detail) == (proto, vrf,
-                                                               det)
-                          and a.b_key)
+            direct.extend(dom_adjs)
             continue
+        # A hub hides per-adjacency state, so a neighbour that is not
+        # up must not vanish into it: draw those pairwise as well.
+        unhealthy.extend(a for a in dom_adjs if not _adj_healthy(a))
         label = det if proto == "bgp" else f"OSPF {det}"
         if vrf != "default":
             label += f"\nvrf {vrf}"
@@ -1837,6 +1937,12 @@ def _render_routing(xb: "_XmlBuilder", parent: str, topo: Topology,
         wp = (_bow(pos, adj.a_key, adj.b_key, bow_offset)
               if adj.b_key else None)
         xb.edge(parent, adj.label, style, src, dst, waypoint=wp)
+    for adj in unhealthy:
+        src, dst = ids.get(adj.a_key), ids.get(adj.b_key)
+        if src and dst:
+            xb.edge(parent, adj.label, ADJ_DOWN_EDGE_STYLE, src, dst,
+                    waypoint=_bow(pos, adj.a_key, adj.b_key,
+                                  bow_offset or 45.0))
 
 
 BLOCK_NODE_STYLE = (
@@ -1848,7 +1954,7 @@ SPLIT_MIN_SWITCHES = 16
 
 def _sub_topology(topo: Topology, keys: set) -> Topology:
     sub = Topology()
-    for k in keys:
+    for k in sorted(keys):
         dev = topo.devices.get(k)
         if dev:
             sub.upsert_device(Device(**{f: getattr(dev, f)
@@ -1904,8 +2010,8 @@ def write_ipam_csv(path: str, topo: Topology,
                    port_details: dict[str, dict[str, "PortInfo"]]) -> int:
     """Flat addressing inventory: one row per configured address.
 
-    Columns: hostname, mgmt_ip, interface, vlan, ip, prefix, network,
-    vrf. The network column makes 'everything on this subnet' a single
+    Columns: hostname, interface, vlan, ip, prefix, network, vrf,
+    active_gateway. The network column makes 'everything on this subnet' a single
     filter in Excel or a grep on the CLI.
     """
     count = 0
@@ -1937,7 +2043,7 @@ def write_ipam_csv(path: str, topo: Topology,
 
 def build_split_pages(topo: Topology, info: "ScopeInfo",
                       l2_edges, l3_segments, routing_adjs, vsx_pairs,
-                      detail_small: bool = True):
+                      detail_small: bool = True, layout: str = "tiered"):
     """Area-grouped tabs: Overview, Core L3, then per area (Core-Agg
     first, then each block) L1 / L2 / L3 / IPAM adjacent, so reviewing
     walks one area completely before the next."""
@@ -1956,6 +2062,12 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
                 ep_block[k] = info.block[other]
     core = set(info.core_keys)
     aggs = {k for k, t in info.tier.items() if t == 1}
+
+    def lay(sub):
+        # Pin the estate-wide core on every sub-page. Re-detecting it per
+        # page ties core with agg on a single-block sub-graph (both end
+        # up in the top row) and would ignore --core / --layout.
+        return _layout(sub, vsx_pairs, layout, sorted(core))
 
     def l2_scope(e):
         return _scope_of_pair(info, e.a_key, e.b_key)
@@ -1984,10 +2096,10 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
     # ---- Overview ------------------------------------------------------
     def render_overview(xb):
         sub = _sub_topology(topo, core)
-        pos = _layout(sub, vsx_pairs)
+        pos = lay(sub)
         ids = {}
         _vsx_boxes(xb, "1", pos, vsx_pairs, core)
-        for k in core:
+        for k in sorted(core):
             x, y = pos[k]
             ids[k] = xb.node("1", topo.devices[k].label, SWITCH_STYLE, x, y)
         for e in sub.edges.values():
@@ -2057,7 +2169,7 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
                 if a.b_key:
                     keys.add(a.b_key)
             sub = _sub_topology(topo, keys)
-            pos = _layout(sub, vsx_pairs)
+            pos = lay(sub)
             if segs:
                 _render_l3(xb, "1", sub, pos, segs, detail=detail_small)
             if adjs:
@@ -2075,7 +2187,7 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
         def render(xb, edges=edges):
             keys = {e.a_key for e in edges} | {e.b_key for e in edges}
             sub = _sub_topology(topo, keys)
-            pos = _layout(sub, vsx_pairs)
+            pos = lay(sub)
             _render_l2(xb, "1", sub, pos, edges, vsx_pairs,
                        detail=detail_small)
         pages.append((name, pid, render))
@@ -2084,7 +2196,7 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
     def render_coreagg_l1(xb):
         keys = core | aggs
         sub = _sub_topology(topo, keys)
-        pos = _layout(sub, vsx_pairs)
+        pos = lay(sub)
         _render_physical(xb, "1", sub, pos, vsx_pairs,
                          detail=detail_small)
     pages.append(("Core-Agg L1", "page-l1-coreagg", render_coreagg_l1))
@@ -2101,7 +2213,7 @@ def build_split_pages(topo: Topology, info: "ScopeInfo",
         sub = _sub_topology(topo, keys)
 
         def render_phys(xb, sub=sub):
-            pos = _layout(sub, vsx_pairs)
+            pos = lay(sub)
             _render_physical(xb, "1", sub, pos, vsx_pairs,
                              detail=detail_small)
         pages.append((f"{blk} L1", f"page-l1-b{bid}", render_phys))
@@ -2123,6 +2235,17 @@ _GRAPH_MODEL = """    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" gu
         {body}
       </root>
     </mxGraphModel>"""
+
+
+def _mxfile(pages: list[tuple[str, str, str]]) -> str:
+    """Wrap [(name, page_id, cells_body), ...] as a draw.io file."""
+    diagrams = "\n".join(
+        f'  <diagram name="{_XmlBuilder._esc(name)}" id="{page_id}">\n'
+        + _GRAPH_MODEL.format(body=body)
+        + "\n  </diagram>"
+        for name, page_id, body in pages)
+    return (f'<mxfile host="lldp_mapper" type="device">\n'
+            f'{diagrams}\n</mxfile>\n')
 
 
 def to_drawio_xml(topo: Topology,
@@ -2193,15 +2316,9 @@ def to_drawio_xml(topo: Topology,
                      ", ".join(info.block_label.values()))
             for name, pid, render in build_split_pages(
                     topo, info, l2_edges, l3_segments, routing_adjs,
-                    vsx_pairs, detail_small=True):
+                    vsx_pairs, detail_small=True, layout=layout):
                 page(name, pid, render)
-            diagrams = "\n".join(
-                f'  <diagram name="{escape(name)}" id="{page_id}">\n'
-                + _GRAPH_MODEL.format(body=body)
-                + "\n  </diagram>"
-                for name, page_id, body in pages)
-            return (f'<mxfile host="lldp_mapper" type="device">\n'
-                    f'{diagrams}\n</mxfile>\n')
+            return _mxfile(pages)
 
         page("Physical", "page-phys",
              lambda xb: _render_physical(xb, "1", topo, pos, vsx_pairs,
@@ -2219,13 +2336,7 @@ def to_drawio_xml(topo: Topology,
                  lambda xb: _render_routing(xb, "1", topo, pos,
                                             routing_adjs))
 
-    diagrams = "\n".join(
-        f'  <diagram name="{escape(name)}" id="{page_id}">\n'
-        + _GRAPH_MODEL.format(body=body)
-        + "\n  </diagram>"
-        for name, page_id, body in pages)
-    return (f'<mxfile host="lldp_mapper" type="device">\n'
-            f'{diagrams}\n</mxfile>\n')
+    return _mxfile(pages)
 
 
 def to_diff_drawio(old: Topology, new: Topology, diff: TopoDiff) -> str:
@@ -2264,20 +2375,8 @@ def to_diff_drawio(old: Topology, new: Topology, diff: TopoDiff) -> str:
                 xb.edge("lyr_diff", prefix, style, src, dst,
                         src_label=e.a_port, dst_label=e.b_port)
 
-    body = "\n        ".join(xb.cells)
-    return f"""<mxfile host="lldp_mapper" type="device">
-  <diagram name="Topology diff" id="lldp-diff">
-    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1"
-                  tooltips="1" connect="1" arrows="1" fold="1" page="1"
-                  pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
-      <root>
-        <mxCell id="0"/>
-        {body}
-      </root>
-    </mxGraphModel>
-  </diagram>
-</mxfile>
-"""
+    return _mxfile([("Topology diff", "lldp-diff",
+                     "\n        ".join(xb.cells))])
 
 
 def to_json(topo: Topology,
@@ -2476,17 +2575,27 @@ def run_scan(args) -> int:
     want_routing = want_details and not args.no_routing
     polled: list[PollResult] = []
     with cf.ThreadPoolExecutor(max_workers=args.poll_workers) as pool:
-        futures = [
+        futures = {
             pool.submit(poll_device, ip, credentials,
                         args.api_version, args.verify_ssl,
-                        want_details, want_routing)
+                        want_details, want_routing): ip
             for ip in candidates
-        ]
+        }
         for fut in cf.as_completed(futures):
-            result = fut.result()
+            try:
+                result = fut.result()
+            except Exception:                        # noqa: BLE001
+                # One switch with an unexpected response shape must not
+                # abort the whole estate.
+                log.exception("%s: unexpected error while polling — "
+                              "skipping this host", futures[fut])
+                continue
             if result:
                 polled.append(result)
 
+    # Completion order is arbitrary; sort so the JSON, the diagram and
+    # the "first IP wins" dedupe are identical run to run.
+    polled.sort(key=lambda pr: ipaddress.ip_address(pr.device.mgmt_ip))
     polled = dedupe_polled(polled)
     if not polled:
         log.error("No AOS-CX switches successfully polled.")

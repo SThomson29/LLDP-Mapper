@@ -86,12 +86,16 @@ doubles as a report of which switches still hold the old password.
 number rendered at its own end of the link, beside the switch it
 belongs to. VSX pairs sit side by side inside a dashed container with
 their role (primary/secondary) in the label. `--include-endpoints`
-adds APs, phones, and servers seen in LLDP as dashed grey leaf nodes.
+adds APs, phones, and servers seen in LLDP as dashed grey leaf nodes,
+laid out in a grid (four per row, in switch-port order) under the
+switch they attach to; the switch's slot widens and the tier below
+moves down to make room, so nothing overlaps.
 
 **Layer 2.** Physical links collapsed into their LAGs, so a dual-cable
 VSX ISL is one edge labelled `2x links · trunk 10-12,20 · native 1`
 with the LAG names at each end. VLAN config comes from the aggregated
-interface and trunk lists are range-compressed. With
+interface and trunk lists are range-compressed; a trunk with no
+explicit allowed list is labelled `trunk all`. With
 `--include-endpoints`, edge ports also appear labelled with their
 access VLAN or trunk config — which is what gives a single stack
 (no inter-switch links at all) a useful L2 view, and doubles as an
@@ -116,7 +120,10 @@ session state. Peers matched to the inventory by interface/peer IP
 firewalls — renders as an amber "external peer" node rather than
 disappearing. An OSPF area or iBGP mesh spanning three or more
 switches collapses into a protocol hub with one spoke per member
-(an 8-switch iBGP full mesh is 8 spokes, not 28 edges).
+(an 8-switch iBGP full mesh is 8 spokes, not 28 edges). A hub hides
+per-neighbour state, so any adjacency inside one that is *not* up
+(OSPF other than FULL/2-WAY, BGP other than Established) is also drawn
+as its own red dashed edge labelled with the state.
 
 ## Layout
 
@@ -131,7 +138,9 @@ Within a row, order follows the **primary parent's interface numbers**
 (the `-01`/`-a` device of a pair): core port 1/1/1's block sits
 leftmost, so the drawing matches the patching. The scan log names the
 detected core tier; pin it manually with `--core <hostname-or-IP>`
-(repeatable) if an unusual topology fools the detection, or use
+(repeatable) if an unusual topology fools the detection — the log says
+so when it can't separate tiers (a core pair with a single
+distribution pair is structurally symmetric, for example) — or use
 `--layout circle` for the original radial layout.
 
 ## Large estates
@@ -231,13 +240,13 @@ lockout means waiting out the idle timeout.
 **API versioning.** Each switch's version is negotiated up front via
 an unauthenticated `GET /rest`, using the switch-declared latest, per
 Aruba's guidance — mixed-firmware estates each get their newest
-schema, and 10.15+-only platforms work without configuration. If the
-index is unreachable the client falls back to v10.04. The negotiated
-version appears per switch in the scan log.
+schema, and 10.15+-only platforms work without configuration. A host
+with no usable index is treated as not AOS-CX and skipped (see Scan
+scope). The negotiated version appears per switch in the scan log.
 
 **Collection resilience.** Interface and LLDP data use a single
 wildcard query where the firmware supports it, falling back to
-per-interface iteration otherwise. An SVI that returns no address in
+per-interface iteration if it is rejected or times out. An SVI that returns no address in
 the filtered response (seen on some firmware when the VLAN is down)
 gets one unfiltered re-fetch, and recoveries are logged. Active
 gateway is collected by a separate, fully isolated query — if a
@@ -246,12 +255,19 @@ column. If a switch somehow yields no interface details at all, a
 warning names it rather than letting the gap pass silently. The
 OSPF/BGP walk is per-resource and prunes any branch that 404s.
 
-**Scan scope.** Discovery is a TCP probe of 443 across each CIDR;
-anything answering gets a REST login attempt. Non-CX devices with
-HTTPS management (iLO, printers, firewalls) are skipped with a warning
-after the login fails — harmless, but expect log noise on busy
-subnets, and remember that failed logins matter on devices with
-lockout policies. A single host can be included as a `/32`.
+**Scan scope.** Discovery is a TCP probe of 443 across each CIDR.
+Each responder is first asked for the unauthenticated `GET /rest`
+version index; only hosts that return one get a login attempt.
+Non-CX devices with HTTPS management (iLO, printers, firewalls) are
+skipped with a warning and never see your credentials. If a genuine
+switch is skipped this way, pinning `--api-version v10.04` bypasses
+the check (and then every responder in the range is tried, so narrow
+the CIDR). A single host can be included as a `/32`.
+
+**Failure isolation.** A switch that returns something unexpected is
+logged with a traceback and skipped; the rest of the estate still
+maps. Results are sorted by management IP before output, so the JSON
+and CSV are stable run to run and diff cleanly in git.
 
 ## Tests
 
@@ -275,7 +291,7 @@ and the firmware combination that once emptied interface collection.
 
 ```
 lldp_mapper.py             the tool (stdlib + requests only)
-requirements.txt           just requests (create if you want pip -r)
+requirements.txt           just requests
 creds.example.json         credential file template
 .gitignore                 keeps output, addressing CSVs, and real creds out
 test_*.py                  the seven suites above (+ shared fixtures

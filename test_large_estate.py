@@ -324,8 +324,9 @@ class AgFw(_ACR):
     def __init__(self): self.host = "sim-ag"
     def get(self, path, params=None):
         attrs = (params or {}).get("attributes", "")
-        if path == "/system/interfaces/*" and "vsx_virtual_ip4" in attrs:
-            return {"vlan10": {"vsx_virtual_ip4": ["10.10.0.254/24"]}}
+        if path == "/system/interfaces" and "vsx_virtual_ip4" in attrs:
+            return {"vlan10": {"name": "vlan10",
+                               "vsx_virtual_ip4": ["10.10.0.254/24"]}}
         if path == "/system/interfaces/*":
             return {"vlan10": {"ip4_address": "10.10.0.1/24",
                                "vlan_mode": None, "vlan_tag": None,
@@ -335,3 +336,67 @@ class AgFw(_ACR):
 adet = AgFw().interface_details()
 assert adet["vlan10"].active_gateway == "10.10.0.254"
 print("active-gateway collection OK where supported")
+
+# --- REGRESSION: per-block split pages keep core above agg ------------------
+# A core pair plus ONE block is symmetric to the peeling (cores and aggs
+# tie), so sub-pages must inherit the estate-wide core, not re-detect it.
+from lldp_mapper import _sub_topology as _subt, build_split_pages as _bsp
+import logging as _lg
+_lg.disable(_lg.CRITICAL)
+
+def _estate(n_blocks, n_acc, n_eps=0):
+    t = Topology(); c = itertools.count(1)
+    def lk(a, b):
+        t.add_edge(Edge(a, f"1/1/{next(c)}", b, f"1/1/{next(c)}"))
+    for n in ("core-1", "core-2"):
+        t.upsert_device(Device(key=n, hostname=n, is_switch=True))
+    lk("core-1", "core-2"); prs = [("core-1", "core-2")]
+    for b in range(1, n_blocks + 1):
+        a1, a2 = f"agg-{b}a", f"agg-{b}b"
+        for n in (a1, a2):
+            t.upsert_device(Device(key=n, hostname=n, is_switch=True))
+            lk(n, "core-1"); lk(n, "core-2")
+        lk(a1, a2); prs.append((a1, a2))
+        for i in range(n_acc):
+            s = f"acc-{b}-{i}"
+            t.upsert_device(Device(key=s, hostname=s, is_switch=True))
+            lk(s, a1); lk(s, a2)
+            for e in range(n_eps):
+                ep = f"ap-{b}-{i}-{e}"
+                t.upsert_device(Device(key=ep, hostname=ep))
+                lk(s, ep)
+    return t, prs
+
+st, sp = _estate(3, 4)
+sinfo = classify_scopes(st, sp)
+skeys = {k for k, b in sinfo.block.items() if b == 0} | sinfo.core_keys
+ssub = _subt(st, skeys)
+spos = _layout(ssub, sp, "tiered", sorted(sinfo.core_keys))
+assert spos["core-1"][1] < spos["agg-1a"][1] < spos["acc-1-0"][1], spos
+sxml = to_drawio_xml(st, vsx_pairs=sp, split="always")
+ET.fromstring(sxml)
+print("split block page OK (core above agg above access)")
+
+# --- REGRESSION: endpoints never overlap each other or other nodes ----------
+def _overlaps(pos):
+    ks = list(pos); n = 0
+    for i, a in enumerate(ks):
+        for b in ks[i + 1:]:
+            if (abs(pos[a][0] - pos[b][0]) < 200
+                    and abs(pos[a][1] - pos[b][1]) < 60):
+                n += 1
+    return n
+
+for n_eps in (2, 8, 24):
+    et, ep_pairs = _estate(2, 4, n_eps)
+    assert _overlaps(_layout(et, ep_pairs)) == 0, n_eps
+# endpoints on a non-leaf switch push the next tier down instead
+et, ep_pairs = _estate(2, 2)
+for e in range(9):
+    et.upsert_device(Device(key=f"srv-{e}", hostname=f"srv-{e}"))
+    et.add_edge(Edge("agg-1a", f"1/1/9{e}", f"srv-{e}", "eth0"))
+epos = _layout(et, ep_pairs)
+assert _overlaps(epos) == 0
+assert max(epos[f"srv-{e}"][1] for e in range(9)) < epos["acc-1-0"][1]
+print("endpoint grid OK (no overlaps at 2/8/24 per switch or mid-tier)")
+_lg.disable(_lg.NOTSET)
