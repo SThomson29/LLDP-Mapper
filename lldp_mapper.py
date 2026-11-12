@@ -552,15 +552,24 @@ class AosCxRest:
         rows, found = {}, 0
         attrs = "name,vsx_virtual_ip4"
 
-        try:
-            data = self.get("/system/interfaces",
-                            params={"attributes": attrs, "depth": 2})
+        # Wildcard first (what _interface_details_raw uses and what
+        # 10.09+ answers), then the plain collection with depth=2 for
+        # firmware that rejects the wildcard.
+        for path in ("/system/interfaces/*", "/system/interfaces"):
+            try:
+                data = self.get(path,
+                                params={"attributes": attrs, "depth": 2})
+            except requests.HTTPError as e:
+                log.debug("%s: active-gateway query on %s failed (%s)",
+                          self.host, path, e)
+                continue
             for k, v in (data or {}).items():
                 if isinstance(v, dict):
-                    name = v.get("name") or urllib.parse.unquote(k.rsplit("/", 1)[-1])
+                    name = (v.get("name")
+                            or urllib.parse.unquote(k.rsplit("/", 1)[-1]))
                     rows[name] = v
-        except requests.HTTPError as e:
-            log.debug("%s: bulk active-gateway query failed (%s)", self.host, e)
+            if rows:
+                break
 
         if not rows:
             for name in svis:
@@ -1244,7 +1253,8 @@ def classify_scopes(topo: Topology,
         if n in used:
             continue
         p = pair_of.get(n)
-        unit = sorted([n, p]) if (p in t1 and p not in used) else [n]
+        unit = (sorted([n, p], key=lambda k: _unit_key(topo, k))
+                if (p in t1 and p not in used) else [n])
         used.update(unit)
         bid = len(info.block_label)
         info.block_label[bid] = _block_name(
@@ -1266,9 +1276,37 @@ def classify_scopes(topo: Topology,
 
 
 def _port_sort_key(port: str) -> tuple:
-    """Natural sort for interface names: 1/1/2 before 1/1/10."""
-    nums = tuple(int(x) for x in re.findall(r"\d+", port or ""))
-    return nums if nums else (10**9,)
+    """Natural sort for interface names: 1/1/2 before 1/1/10.
+
+    The leading class digit keeps physical ports, LAGs and anything
+    else in separate bands. Without it the bare number tuples compare
+    across kinds by length -- lag1 -> (1,) sorts ahead of 1/1/1 ->
+    (1,1,1) while lag256 sorts behind it, so a parent with a mix of
+    LAG and physical uplinks orders its children incoherently.
+    """
+    name = (port or "").strip()
+    nums = tuple(int(x) for x in re.findall(r"\d+", name))
+    if not nums:
+        return (2, (10**9,))
+    if name.lower().startswith("lag"):
+        return (1, nums)
+    return (0, nums)
+
+
+def _name_sort_key(name: str) -> tuple:
+    """Natural sort for hostnames: sw-2 before sw-10, case-insensitive.
+
+    Used to order VSX pair members so the -01/-a device is always the
+    left-hand / primary one. Sorting on the chassis MAC instead makes
+    the member order arbitrary and inconsistent between pairs.
+    """
+    parts = re.split(r"(\d+)", (name or "").lower())
+    return tuple((1, int(p)) if p.isdigit() else (0, p)
+                 for p in parts if p != "")
+
+
+def _unit_key(topo: "Topology", key: str) -> tuple:
+    return _name_sort_key(topo.devices[key].hostname or key)
 
 
 TIER_H = 280.0        # vertical distance between tiers
@@ -1369,7 +1407,8 @@ def _layout_tiered(topo: Topology,
                     continue
                 p = pair_of.get(n)
                 if p in row and p not in used:
-                    units.append(sorted([n, p]))
+                    units.append(sorted([n, p],
+                                        key=lambda k: _unit_key(topo, k)))
                     used.update((n, p))
                 else:
                     units.append([n])
@@ -1412,7 +1451,19 @@ def _layout_tiered(topo: Topology,
             # across both VSX members is wrong under crossed patching:
             # a child on core-01:1/1/2 + core-02:1/1/1 must sort by
             # 1/1/2, not steal first place via core-02.
-            def uplink_port_key(unit):
+            def uplink_port_key(unit, parent_unit):
+                """Order children by their uplink port on THIS block's
+                parent, preferring the primary (-01/-a) member.
+
+                Every child in a block must be measured against the
+                same physical switch. Picking the reference parent per
+                child (e.g. whichever of its neighbours sorts first by
+                hostname) compares core-01's port numbers against
+                core-02's, so a switch cabled to core-02:1/1/1 jumps
+                ahead of one on core-01:1/1/2. Children with no link
+                to the primary fall to the secondary and sort after
+                the primary-homed ones, in the secondary's port order.
+                """
                 unit_set = set(unit)
                 ports_by_parent: dict[str, tuple] = {}
                 for e in topo.edges.values():
@@ -1424,16 +1475,23 @@ def _layout_tiered(topo: Topology,
                             k = _port_sort_key(pport)
                             if k < ports_by_parent.get(parent, (10**9,)):
                                 ports_by_parent[parent] = k
-                for parent in sorted(
-                        ports_by_parent,
-                        key=lambda p: topo.devices[p].hostname or p):
-                    return (ports_by_parent[parent],
-                            topo.devices[unit[0]].hostname or unit[0])
-                return ((10**9,),
-                        topo.devices[unit[0]].hostname or unit[0])
+                # parent_unit is already hostname-ordered, so index 0 is
+                # the primary. Fall back to any other parent last.
+                candidates = list(parent_unit) + sorted(
+                    (p for p in ports_by_parent if p not in parent_unit),
+                    key=lambda p: _unit_key(topo, p))
+                for rank, parent in enumerate(candidates):
+                    if parent in ports_by_parent:
+                        return (rank, ports_by_parent[parent],
+                                _unit_key(topo, unit[0]))
+                return (10**9, (10**9,), _unit_key(topo, unit[0]))
             ordered: list[list[str]] = []
             for gi in sorted(groups):
-                ordered.extend(sorted(groups[gi], key=uplink_port_key))
+                parent_unit = (unit_rows[t - 1][gi]
+                               if gi < len(unit_rows.get(t - 1, [])) else [])
+                ordered.extend(sorted(
+                    groups[gi],
+                    key=lambda u, pu=parent_unit: uplink_port_key(u, pu)))
             unit_rows[t] = ordered
             group_of[t] = groups
             for i, unit in enumerate(ordered):
@@ -1557,7 +1615,8 @@ def _layout_circle(topo: Topology,
             continue
         partner = pair_of.get(dev.key)
         if partner and partner in topo.devices:
-            slots.append(sorted([dev.key, partner]))
+            slots.append(sorted([dev.key, partner],
+                                key=lambda k: _unit_key(topo, k)))
             placed.update((dev.key, partner))
         else:
             slots.append([dev.key])

@@ -324,7 +324,8 @@ class AgFw(_ACR):
     def __init__(self): self.host = "sim-ag"
     def get(self, path, params=None):
         attrs = (params or {}).get("attributes", "")
-        if path == "/system/interfaces" and "vsx_virtual_ip4" in attrs:
+        if (path in ("/system/interfaces/*", "/system/interfaces")
+                and "vsx_virtual_ip4" in attrs):
             return {"vlan10": {"name": "vlan10",
                                "vsx_virtual_ip4": ["10.10.0.254/24"]}}
         if path == "/system/interfaces/*":
